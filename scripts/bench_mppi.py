@@ -15,17 +15,17 @@ from hound_nav.deps_path import setup_dependency_paths
 def main() -> None:
     setup_dependency_paths()
 
-    from BeamNGRL.control.UW_mppi.MPPI import MPPI
-    from BeamNGRL.control.UW_mppi.Dynamics.SimpleCarDynamicsTCUDA import (
+    from mppi.MPPI import MPPI
+    from mppi.Dynamics.SimpleCarDynamicsTCUDA import (
         SimpleCarDynamics,
     )
-    from BeamNGRL.control.UW_mppi.Sampling.Delta_Sampling import Delta_Sampling
+    from mppi.Sampling.Delta_Sampling import Delta_Sampling
     from TrackingCost import SimpleCarCost as OldCost
     from hound_nav.trackingCostCUDA import SimpleCarCost as CudaCost
 
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "nav_example.yaml"
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        Config = yaml.safe_load(f)
+    ssot = Path(__file__).resolve().parents[2] / "hound_core" / "config" / "SSoT.yaml"
+    with open(ssot, "r", encoding="utf-8") as f:
+        Config = yaml.safe_load(f)["nav"]
 
     Dynamics_config = Config["Dynamics_config"]
     Cost_config = Config["Cost_config"]

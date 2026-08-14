@@ -1,0 +1,36 @@
+# Dora dataflow: manager (ROS) + planner (IGHA*) + controller (MPPI).
+#
+# Placeholders filled by launch:
+#   __MANAGER_PY__  __PLANNER_PY__  __CONTROLLER_PY__  __CTRL_TICK_MS__
+
+nodes:
+  - id: manager
+    path: __MANAGER_PY__
+    inputs:
+      tick: dora/timer/millis/__CTRL_TICK_MS__
+      plan:
+        source: planner/plan
+        queue_size: 1
+    outputs:
+      - pdef
+      - map
+      - track
+
+  - id: planner
+    path: __PLANNER_PY__
+    inputs:
+      pdef:
+        source: manager/pdef
+        queue_size: 1
+    outputs:
+      - plan
+
+  - id: controller
+    path: __CONTROLLER_PY__
+    inputs:
+      map:
+        source: manager/map
+        queue_size: 1
+      track:
+        source: manager/track
+        queue_size: 1

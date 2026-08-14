@@ -20,11 +20,16 @@ def _load_kernel():
     cu = str(cuda_dir / "tracking_cost.cu")
     # Jetson: prefer sm_87 (Orin) when TORCH_CUDA_ARCH_LIST unset.
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.7")
+    kwargs = {}
+    ext_dir = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if ext_dir:
+        kwargs["build_directory"] = ext_dir
     return load(
         name="hound_tracking_cost",
         sources=[cpp, cu],
         verbose=False,
         extra_cuda_cflags=["-O3", "--use_fast_math"],
+        **kwargs,
     )
 
 

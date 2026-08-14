@@ -4,8 +4,9 @@
   <name>hound_nav</name>
   <version>0.1.0</version>
   <description>
-    ROS adapter for IGHA* (planner process) + BeamNGRL UW_mppi (main thread).
-    Treats IGHAStar and BeamNGRL as external PYTHONPATH dependencies.
+    Dora 3-node nav: manager (ROS + world-frame traj), planner (in-process IGHA*),
+    controller (mppi → AckermannDriveStamped). IGHAStar is an external
+    PYTHONPATH dependency; MPPI lives in the mppi package. dora-rs via pip.
   </description>
   <maintainer email="hound@todo.todo">hound</maintainer>
   <license>Apache-2.0</license>
@@ -20,6 +21,7 @@
   <depend>std_msgs</depend>
   <depend>ackermann_msgs</depend>
   <depend>hound_mapping</depend>
+  <depend>mppi</depend>
 
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>

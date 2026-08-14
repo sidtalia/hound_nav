@@ -23,9 +23,9 @@ class LocalMapSnapshot:
 
 @dataclass
 class PDef:
-    """Snapshot consumed by the planner/MPPI loop (BeamNG example shape)."""
+    """Snapshot consumed by the planner/MPPI loop (BeamNG-compatible plant shape)."""
 
-    state: np.ndarray  # (17,) pos,rpy,vel,acc,gyro,steer,thr
+    state: np.ndarray  # (N,) plant state; N = control_state_dims (SSoT)
     height_bev: np.ndarray  # HxW robot-centric, relative Z
     normal_bev: np.ndarray  # HxW x 3
     costmap: np.ndarray  # HxW, 0/255 IGHA* convention
@@ -36,70 +36,30 @@ class PDef:
     map_size: float = 100.0
 
 
-def _axis_aligned_window(
-    img: np.ndarray,
-    ox: float,
-    oy: float,
-    res_w: float,
-    center_xy: np.ndarray,
-    map_size_m: float,
-    map_res: float,
-    border_value: float = 0.0,
-) -> np.ndarray:
-    """Crop/resample robot-centered LocalMap into n×n at map_res (no yaw)."""
-    n = int(round(map_size_m / map_res))
-    scale = float(map_res) / float(res_w)
-    half = 0.5 * n
-    cx, cy = float(center_xy[0]), float(center_xy[1])
-    M = np.array(
-        [
-            [scale, 0.0, (cx - ox) / res_w - scale * half],
-            [0.0, scale, (cy - oy) / res_w - scale * half],
-        ],
-        dtype=np.float64,
-    )
-    src = img if img.dtype == np.float32 else img.astype(np.float32)
-    if src.ndim == 2:
-        return cv2.warpAffine(
-            src,
-            M,
-            (n, n),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=border_value,
-        )
-    # HxWxC (normals)
-    out = cv2.warpAffine(
-        src,
-        M,
-        (n, n),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=border_value,
-    )
-    return out
-
-
 class PDefBuffer:
-    """ROS callbacks write; control loop reads under a lock."""
+    """ROS callbacks write; manager reads under a lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, state_dims: int = 17) -> None:
+        if state_dims < 2:
+            raise ValueError(f"state_dims must be >= 2, got {state_dims}")
+        self._state_dims = int(state_dims)
         self._lock = threading.Lock()
-        self._state = np.zeros(17, dtype=np.float64)
+        self._state = np.zeros(self._state_dims, dtype=np.float64)
         self._state_valid = False
         self._map: Optional[LocalMapSnapshot] = None
         self._target_wp: Optional[np.ndarray] = None
-        self._injected_path: Optional[np.ndarray] = None  # Nx4 world (x,y,yaw,vel)
         self._last_action = np.zeros(2, dtype=np.float64)
-        self._state_stamp_sec: float = 0.0  # receive time
-        self._state_pub_stamp_sec: float = 0.0  # optional publisher time
+        self._state_stamp_sec: float = 0.0
         self._map_gen: int = 0
-        self._inject_gen: int = 0
         # Set on new control_state; control loop waits on this when event-driven.
         self._state_event = threading.Event()
-        # Kick background BEV rebuild (map/state).
+        # Kick background BEV rebuild (map).
         self._bev_event = threading.Event()
         self._ready_bev: Any = None
+
+    @property
+    def state_dims(self) -> int:
+        return self._state_dims
 
     def notify_state(self) -> None:
         self._state_event.set()
@@ -139,58 +99,29 @@ class PDefBuffer:
 
     def set_state_vector(
         self,
-        state17: np.ndarray,
+        state: np.ndarray,
         stamp_sec: float = 0.0,
-        pub_stamp_sec: float = 0.0,
     ) -> None:
-        """Full BeamNG plant state: pos,rpy,vel,A,G,steer,wheelspeed (17).
-
-        stamp_sec is receive time (used for state→cmd latency).
-        pub_stamp_sec is optional publisher time for probe correlation only.
-        """
-        arr = np.asarray(state17, dtype=np.float64).reshape(-1)
-        if arr.shape[0] < 17:
+        """Plant state vector (length = control_state_dims from SSoT)."""
+        arr = np.asarray(state, dtype=np.float64).reshape(-1)
+        if arr.shape[0] < self._state_dims:
             return
         with self._lock:
-            self._state[:] = arr[:17]
-            self._last_action = np.copy(self._state[15:17])
+            self._state[:] = arr[: self._state_dims]
+            if self._state_dims >= 2:
+                self._last_action = np.copy(self._state[-2:])
             self._state_valid = True
             if stamp_sec > 0.0:
                 self._state_stamp_sec = float(stamp_sec)
-            self._state_pub_stamp_sec = float(pub_stamp_sec)
         self._state_event.set()
-        self._bev_event.set()
 
     def get_state_stamp_sec(self) -> float:
         with self._lock:
             return self._state_stamp_sec
 
-    def get_state_pub_stamp_sec(self) -> float:
-        with self._lock:
-            return self._state_pub_stamp_sec
-
     def map_generation(self) -> int:
         with self._lock:
             return self._map_gen
-
-    def inject_generation(self) -> int:
-        with self._lock:
-            return self._inject_gen
-
-    def get_injected_path(self) -> Optional[np.ndarray]:
-        with self._lock:
-            if self._injected_path is None:
-                return None
-            return np.copy(self._injected_path)
-
-    def set_injected_path(self, path: Optional[np.ndarray]) -> None:
-        with self._lock:
-            if path is None:
-                self._injected_path = None
-            else:
-                self._injected_path = np.asarray(path, dtype=np.float64)
-            self._inject_gen += 1
-        self._bev_event.set()
 
     def set_odom_pose(
         self,
@@ -205,23 +136,24 @@ class PDefBuffer:
         vz: float = 0.0,
     ) -> None:
         with self._lock:
-            self._state[0] = x
-            self._state[1] = y
-            self._state[2] = z
-            self._state[3] = roll
-            self._state[4] = pitch
-            self._state[5] = yaw
-            self._state[6] = vx
-            self._state[7] = vy
-            self._state[8] = vz
+            if self._state_dims >= 9:
+                self._state[0] = x
+                self._state[1] = y
+                self._state[2] = z
+                self._state[3] = roll
+                self._state[4] = pitch
+                self._state[5] = yaw
+                self._state[6] = vx
+                self._state[7] = vy
+                self._state[8] = vz
             self._state_valid = True
         self._state_event.set()
-        self._bev_event.set()
 
     def set_last_action(self, action: np.ndarray) -> None:
         with self._lock:
             self._last_action = np.asarray(action, dtype=np.float64).reshape(2)
-            self._state[15:17] = self._last_action
+            if self._state_dims >= 2:
+                self._state[-2:] = self._last_action
 
     def set_local_map(self, snap: LocalMapSnapshot) -> None:
         with self._lock:
@@ -240,14 +172,11 @@ class PDefBuffer:
 
     def snapshot_pdef(
         self,
-        map_size_m: float,
-        map_res: float,
         goal_xy: Optional[np.ndarray] = None,
     ) -> Optional[PDef]:
-        """Take mapper LocalMap (already robot-centered) → BeamNG BEV tensors.
+        """Mapper LocalMap as-is → relative-Z height + IGHA 0/255 cost.
 
-        No yaw warp / slope recompute — only axis-aligned crop/resample to the
-        nav map size/res, relative-Z, and [0,1]→IGHA 0/255 cost.
+        No crop/resample. Grid size and resolution come from the message.
         """
         with self._lock:
             if not self._state_valid or self._map is None:
@@ -260,49 +189,29 @@ class PDefBuffer:
             ox, oy, res_w = m.origin_x, m.origin_y, m.resolution
             target_wp = None if self._target_wp is None else np.copy(self._target_wp)
 
-        n = int(round(map_size_m / map_res))
-        if n < 8:
+        h, w = int(elev.shape[0]), int(elev.shape[1])
+        if h < 8 or w < 8 or cost.shape != elev.shape:
             return None
 
-        # Geometric center of LocalMap (== robot when mapper centers extract).
         center = np.array(
-            [
-                ox + 0.5 * elev.shape[1] * res_w,
-                oy + 0.5 * elev.shape[0] * res_w,
-            ],
+            [ox + 0.5 * w * res_w, oy + 0.5 * h * res_w],
             dtype=np.float64,
         )
+        map_size = float(h) * float(res_w)
 
-        height = _axis_aligned_window(
-            elev, ox, oy, res_w, center, map_size_m, map_res, border_value=0.0
-        )
-        cost_s = _axis_aligned_window(
-            cost, ox, oy, res_w, center, map_size_m, map_res, border_value=1.0
-        )
-
-        z0 = float(height[n // 2, n // 2]) if np.isfinite(height[n // 2, n // 2]) else float(
+        height = np.ascontiguousarray(elev, dtype=np.float32)
+        z0 = float(height[h // 2, w // 2]) if np.isfinite(height[h // 2, w // 2]) else float(
             state[2]
         )
         height = np.nan_to_num(height - z0, nan=0.0, posinf=0.0, neginf=0.0).astype(
             np.float32, copy=False
         )
 
-        if normals is not None and normals.ndim == 3 and normals.shape[2] >= 3:
-            normal = _axis_aligned_window(
-                normals[..., :3],
-                ox,
-                oy,
-                res_w,
-                center,
-                map_size_m,
-                map_res,
-                border_value=0.0,
-            )
-            normal = normal.astype(np.float32, copy=False)
-            norm = np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
-            normal = normal / norm
+        if normals is not None and normals.ndim == 3 and normals.shape[:2] == (h, w):
+            normal = np.ascontiguousarray(normals[..., :3], dtype=np.float32)
+            nrm = np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
+            normal = normal / nrm
         else:
-            # Fallback if older LocalMap without normals.
             nx = -cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
             ny = -cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
             nz = np.ones_like(height)
@@ -310,7 +219,7 @@ class PDefBuffer:
             normal /= np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
             normal = normal.astype(np.float32, copy=False)
 
-        # Mapper cost is [0,1] lethal; IGHA*/TrackingCost expect 0 lethal / 255 free.
+        cost_s = np.ascontiguousarray(cost, dtype=np.float32)
         costmap = np.where(cost_s < 0.5, 255.0, 0.0).astype(np.float32)
 
         return PDef(
@@ -321,6 +230,6 @@ class PDefBuffer:
             map_center=center,
             goal=None if goal_xy is None else np.asarray(goal_xy, dtype=np.float64),
             target_wp=target_wp,
-            map_res=map_res,
-            map_size=map_size_m,
+            map_res=float(res_w),
+            map_size=map_size,
         )

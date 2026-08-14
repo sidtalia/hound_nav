@@ -1,1 +1,1 @@
-"""HOUND navigation: IGHA* + UW_mppi over ROS LocalMap / odom."""
+"""HOUND navigation: IGHA* + mppi over ROS LocalMap / odom."""
