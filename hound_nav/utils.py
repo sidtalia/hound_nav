@@ -15,23 +15,40 @@ def update_goal(
     wp_radius=2.0,
 ):
     """Advance along mission waypoints with lookahead; return (goal_xy, done, index)."""
+    target_WP = np.asarray(target_WP, dtype=np.float64)
+    n = int(target_WP.shape[0]) if target_WP.ndim >= 1 else 0
+    if n < 1:
+        return pos, True, 0
+
+    # Clamp: past-end index means mission already finished (esp. single-WP).
+    if current_wp_index < 0:
+        current_wp_index = 0
+    if current_wp_index >= n:
+        return np.asarray(pos, dtype=np.float64)[:2].copy(), True, n
+
     if goal is None:
-        if current_wp_index == 0:
-            return target_WP[current_wp_index, :2], False, current_wp_index
-        return pos, True, current_wp_index
-    d = np.linalg.norm(goal - pos)
-    if d < wp_radius and current_wp_index == len(target_WP) - 1:
-        current_wp_index += step_size
-        if current_wp_index >= len(target_WP) - 1:
-            return pos, True, current_wp_index
+        return target_WP[current_wp_index, :2].copy(), False, current_wp_index
+
+    pos = np.asarray(pos, dtype=np.float64)[:2]
+    goal = np.asarray(goal, dtype=np.float64)[:2]
+    d = float(np.linalg.norm(goal - pos))
+    last = n - 1
+
+    # Arrived at final waypoint → done (do not bump index past end for next tick).
+    if current_wp_index >= last and d < wp_radius:
+        return pos.copy(), True, n
+
     terminate = False
-    while d < lookahead and current_wp_index < len(target_WP) - 1:
-        current_wp_index += step_size
-        d = np.linalg.norm(target_WP[current_wp_index, :2] - pos)
-        if current_wp_index == len(target_WP) - 1 and d < wp_radius:
+    while d < lookahead and current_wp_index < last:
+        current_wp_index = min(current_wp_index + step_size, last)
+        d = float(np.linalg.norm(target_WP[current_wp_index, :2] - pos))
+        if current_wp_index >= last and d < wp_radius:
             terminate = True
             break
-    return target_WP[current_wp_index, :2], terminate, current_wp_index
+
+    if terminate:
+        return pos.copy(), True, n
+    return target_WP[current_wp_index, :2].copy(), False, current_wp_index
 
 
 def wrap_pi(angle: np.ndarray | float) -> np.ndarray | float:

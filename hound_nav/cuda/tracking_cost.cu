@@ -28,7 +28,8 @@ __device__ __forceinline__ float clampf(float x, float lo, float hi)
 
 /**
  * IGHAStar check_crop footprint raster on a robot-centered BEV.
- * bev_cost is already (255 - raw) / 255 (0 free .. 1 lethal).
+ * bev_cost is IGHA free-ness (255 free .. 0 lethal). Per-cell MPC cost is
+ * (255 - raw) / 255 (0 free .. 1 lethal) at lookup — map is not pre-inverted.
  * Returns mean of squared cell costs over the whole vehicle patch.
  * Out-of-map cells count as fully lethal (same spirit as planner OOB → invalid).
  */
@@ -66,7 +67,8 @@ __device__ float footprint_state_cost(
       } else {
         const int ix = meters_to_px(wx, map_size, map_res, map_size_px);
         const int iy = meters_to_px(wy, map_size, map_res, map_size_px);
-        c = bev_cost[iy * map_size_px + ix];
+        const float raw = bev_cost[iy * map_size_px + ix];
+        c = (255.0f - raw) * (1.0f / 255.0f);
       }
       sum_sq += c * c;
       ++n;

@@ -13,11 +13,10 @@ import numpy as np
 @dataclass
 class LocalMapSnapshot:
     elevation: np.ndarray  # HxW float32 world Z (robot-centered, odom axes)
-    cost: np.ndarray  # HxW float32, 0 free .. 1 lethal (semantic OR slope)
+    cost: np.ndarray  # HxW float32, 255 free .. 0 lethal (unobserved≈128)
     origin_x: float
     origin_y: float
     resolution: float
-    normals: Optional[np.ndarray] = None  # HxWx3 unit normals from mapper
     stamp_sec: float = 0.0
 
 
@@ -51,6 +50,7 @@ class PDefBuffer:
         self._last_action = np.zeros(2, dtype=np.float64)
         self._state_stamp_sec: float = 0.0
         self._map_gen: int = 0
+        self._wp_gen: int = 0
         # Set on new control_state; control loop waits on this when event-driven.
         self._state_event = threading.Event()
         # Kick background BEV rebuild (map).
@@ -162,9 +162,18 @@ class PDefBuffer:
         self._bev_event.set()
 
     def set_waypoints(self, wp_xy: np.ndarray) -> None:
-        """wp_xy: Nx2+ in world frame."""
+        """wp_xy: Nx2+ in world frame. Bumps generation only when content changes."""
+        wp = np.asarray(wp_xy, dtype=np.float64)
         with self._lock:
-            self._target_wp = np.asarray(wp_xy, dtype=np.float64)
+            if self._target_wp is not None and self._target_wp.shape == wp.shape:
+                if np.allclose(self._target_wp, wp, rtol=0.0, atol=1e-3):
+                    return
+            self._target_wp = wp
+            self._wp_gen += 1
+
+    def waypoint_generation(self) -> int:
+        with self._lock:
+            return self._wp_gen
 
     def ready(self) -> bool:
         with self._lock:
@@ -174,9 +183,10 @@ class PDefBuffer:
         self,
         goal_xy: Optional[np.ndarray] = None,
     ) -> Optional[PDef]:
-        """Mapper LocalMap as-is → relative-Z height + IGHA 0/255 cost.
+        """Mapper LocalMap elev+cost → relative-Z height + IGHA cost.
 
-        No crop/resample. Grid size and resolution come from the message.
+        Normals for dynamics API are finite-differenced from elevation (mapper
+        no longer publishes them). Cost is free-ness [0,255]; unobserved≈128.
         """
         with self._lock:
             if not self._state_valid or self._map is None:
@@ -185,7 +195,6 @@ class PDefBuffer:
             m = self._map
             elev = m.elevation
             cost = m.cost
-            normals = m.normals
             ox, oy, res_w = m.origin_x, m.origin_y, m.resolution
             target_wp = None if self._target_wp is None else np.copy(self._target_wp)
 
@@ -207,20 +216,20 @@ class PDefBuffer:
             np.float32, copy=False
         )
 
-        if normals is not None and normals.ndim == 3 and normals.shape[:2] == (h, w):
-            normal = np.ascontiguousarray(normals[..., :3], dtype=np.float32)
-            nrm = np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
-            normal = normal / nrm
-        else:
-            nx = -cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
-            ny = -cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
-            nz = np.ones_like(height)
-            normal = np.stack([nx, ny, nz], axis=-1)
-            normal /= np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
-            normal = normal.astype(np.float32, copy=False)
+        # Dynamics API still takes normals; FD from elev (unused in kernel body).
+        nx = -cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
+        ny = -cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
+        nz = np.ones_like(height)
+        normal = np.stack([nx, ny, nz], axis=-1)
+        normal /= np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-6
+        normal = normal.astype(np.float32, copy=False)
 
         cost_s = np.ascontiguousarray(cost, dtype=np.float32)
-        costmap = np.where(cost_s < 0.5, 255.0, 0.0).astype(np.float32)
+        # Already 0..255 free-ness. Legacy: 0..1 lethal → invert to IGHA.
+        if float(np.nanmax(cost_s)) <= 1.0 + 1e-3:
+            costmap = np.where(cost_s < 0.5, 255.0, 0.0).astype(np.float32)
+        else:
+            costmap = np.clip(cost_s, 0.0, 255.0).astype(np.float32)
 
         return PDef(
             state=state,

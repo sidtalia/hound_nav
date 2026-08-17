@@ -67,11 +67,6 @@ class ManagerRos(RosNode):
         cost = _img_f32(msg.costmap)
         if elev is None or cost is None or elev.shape != cost.shape:
             return
-        normals = _img_f32(msg.normals)
-        if normals is not None and (
-            normals.ndim != 3 or normals.shape[:2] != elev.shape
-        ):
-            normals = None
         self._buffer.set_local_map(
             LocalMapSnapshot(
                 elevation=elev,
@@ -79,7 +74,6 @@ class ManagerRos(RosNode):
                 origin_x=float(msg.info.origin.position.x),
                 origin_y=float(msg.info.origin.position.y),
                 resolution=float(msg.info.resolution),
-                normals=normals,
                 stamp_sec=float(msg.header.stamp.sec)
                 + 1e-9 * float(msg.header.stamp.nanosec),
             )
@@ -101,6 +95,13 @@ class ManagerRos(RosNode):
             dtype=np.float64,
         )
         self._buffer.set_waypoints(wp)
+        frame = str(msg.header.frame_id or "")
+        print(
+            f"[hound_manager] mission path: n={len(wp)} "
+            f"frame={frame!r} first=({wp[0, 0]:.2f},{wp[0, 1]:.2f}) "
+            f"last=({wp[-1, 0]:.2f},{wp[-1, 1]:.2f})",
+            flush=True,
+        )
 
     def publish_plan(self, path: np.ndarray) -> None:
         out = Path()
@@ -176,6 +177,7 @@ def main() -> None:
     first_path = False
     goal_reached = False
     last_track_stamp = 0.0
+    last_wp_gen = -1
 
     print(
         f"[hound_manager] up T={timesteps} exp={expansion_limit} "
@@ -234,7 +236,7 @@ def main() -> None:
 
     def _maybe_send_pdef(dora_node: Node) -> None:
         nonlocal query_outstanding, query_sent_t, goal, current_wp_index
-        nonlocal expansion_limit, goal_reached, last_pdef_t
+        nonlocal expansion_limit, goal_reached, last_pdef_t, last_wp_gen
         now = time.perf_counter()
         if (now - last_pdef_t) < pdef_period:
             return
@@ -245,6 +247,16 @@ def main() -> None:
                 return
         if not buffer.ready():
             return
+        wp_gen = buffer.waypoint_generation()
+        if wp_gen != last_wp_gen:
+            last_wp_gen = wp_gen
+            goal = None
+            current_wp_index = 0
+            goal_reached = False
+            print(
+                f"[hound_manager] new mission (gen={wp_gen}); reset goal index",
+                flush=True,
+            )
         pdef = buffer.snapshot_pdef()
         if pdef is None or pdef.target_wp is None or len(pdef.target_wp) < 1:
             return

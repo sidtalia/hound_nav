@@ -101,9 +101,11 @@ class SimpleCarCost(torch.nn.Module):
         BEVmap_normal: torch.Tensor,
         BEVmap_cost: torch.Tensor,
     ) -> None:
+        # Keep IGHA costmap as-is (255 free .. 0 lethal). Per-cell MPC cost
+        # is (255 - raw) / 255 at lookup — do not invert the whole map here.
         self.BEVmap_height = BEVmap_height
         self.BEVmap_normal = BEVmap_normal
-        self.BEVmap_cost = (255.0 - BEVmap_cost.to(dtype=self.dtype)) / 255.0
+        self.BEVmap_cost = BEVmap_cost.to(dtype=self.dtype)
 
     def set_goal(self, goal_state: torch.Tensor) -> None:
         self.goal_state = goal_state[:2]

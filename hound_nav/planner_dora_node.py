@@ -29,8 +29,17 @@ def _search(
     expansion_limit: int,
     stop: bool,
     cruise_speed_mps: float,
+    min_goal_dist_m: float = 0.3,
 ) -> tuple[bool, Optional[np.ndarray], int]:
-    if np.linalg.norm(start_state[:2] - goal_xy[:2]) < 5.0:
+    goal_dist = float(np.linalg.norm(start_state[:2] - goal_xy[:2]))
+    # Too close to bother searching (already at goal). Was hard-coded 5.0 m,
+    # which rejected normal RViz goals a few meters away.
+    if goal_dist < min_goal_dist_m:
+        print(
+            f"[hound_planner] skip search: goal_dist={goal_dist:.2f}m "
+            f"< min={min_goal_dist_m:.2f}m",
+            flush=True,
+        )
         return False, None, 0
 
     bitmap = torch.ones(
@@ -140,8 +149,12 @@ def main() -> None:
         )
         dora.send_output("plan", arr, meta)
         n = 0 if path is None else len(path)
+        gxy = pdef["goal"]
+        sxy = pdef["start"]
+        gdist = float(np.linalg.norm(sxy[:2] - gxy[:2]))
         print(
-            f"[hound_planner] ok={ok} n={n} exp={expansions} dt={dt:.3f}s",
+            f"[hound_planner] ok={ok} n={n} exp={expansions} dt={dt:.3f}s "
+            f"goal_dist={gdist:.2f}m",
             flush=True,
         )
 

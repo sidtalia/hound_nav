@@ -1,8 +1,9 @@
 # hound_nav
 
 IGHA* + **mppi** ROS adapter for HOUND, split into three Dora nodes.
-Consumes `hound_mapping/LocalMap` (pre-fused elev / cost / normals) — no yaw
-warp and no nav-side slope rebuild. MPPI core lives in the `mppi` package
+Consumes `hound_mapping/LocalMap` (elevation + cost free-ness) — no yaw
+warp. Unobserved cells use mapper `unobserved_luminance` (default 128).
+MPPI core lives in the `mppi` package
 (BeamNGRL keeps research copies of dynamics/costs as examples).
 
 ## Graph
@@ -19,7 +20,7 @@ ROS LocalMap / control_state / mission
 ```
 
 Mapper BEV is robot-centered in **odom axes**. Manager uses that grid as-is
-(relative-Z + cost `[0,1]` → IGHA `0/255`). No crop/resample.
+(relative-Z + cost `[0,255]` IGHA free-ness). No crop/resample.
 
 Planner gets the map **with** the query (no separate planner map stream).
 Controller gates `set_BEV` on `map_gen`. Trajectory stitch/invalidate lives in
@@ -65,7 +66,7 @@ ros2 launch hound_core hound_core.launch.py
 
 ## Notes
 
-- Prefer mapper normals over finite-difference on nav.
+- LocalMap is elev+cost only; dynamics API normals are FD from elev if needed.
 - `Cost_config.lethal_w` weights the mapper costmap; it does not re-threshold slope.
 - Do not use `IGHAStarMP`; planner is in-process IGHA* in its Dora node.
 - First-slice traj buffer replaces the whole plan on each successful search.
