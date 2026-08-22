@@ -22,8 +22,9 @@ from hound_mapping.msg import LocalMap
 from hound_nav.deps_path import setup_dependency_paths
 from hound_nav.pdef_buffer import LocalMapSnapshot, PDefBuffer
 from hound_nav.pdef_codec import pack_map, pack_pdef, pack_track, unpack_plan
+from hound_nav.planner_viz import PlannerVisFrame, PlannerVisWorker
 from hound_nav.traj_buffer import TrajBuffer
-from hound_nav.utils import path_pose_to_start_state, update_goal
+from hound_nav.utils import update_goal
 
 
 def _img_f32(msg) -> Optional[np.ndarray]:
@@ -49,6 +50,7 @@ class ManagerRos(RosNode):
             launch_cfg.get("state_topic", "/hound_fcu_control/control_state")
         )
         path_topic = str(launch_cfg.get("path_topic", "/mission/path"))
+        goal_topic = str(launch_cfg.get("goal_topic", "/goal_pose"))
         plan_topic = str(launch_cfg.get("plan_topic", "/hound_nav/local_plan"))
         qos = qos_profile_sensor_data
         self.create_subscription(LocalMap, local_map_topic, self._on_local_map, 1)
@@ -56,10 +58,13 @@ class ManagerRos(RosNode):
             Float64MultiArray, state_topic, self._on_control_state, qos
         )
         self.create_subscription(Path, path_topic, self._on_path, 1)
+        # RViz "2D Goal Pose" (PoseStamped, reliable). Each click = one-WP mission.
+        self.create_subscription(PoseStamped, goal_topic, self._on_goal_pose, 10)
         self._plan_pub = self.create_publisher(Path, plan_topic, 1)
         self.get_logger().info(
             f"manager ROS: map={local_map_topic} state={state_topic} "
-            f"dims={self._state_dims} wps={path_topic} viz={plan_topic}"
+            f"dims={self._state_dims} wps={path_topic} goal={goal_topic} "
+            f"viz={plan_topic}"
         )
 
     def _on_local_map(self, msg: LocalMap) -> None:
@@ -103,6 +108,17 @@ class ManagerRos(RosNode):
             flush=True,
         )
 
+    def _on_goal_pose(self, msg: PoseStamped) -> None:
+        """RViz 2D Goal Pose: replace mission with this one waypoint."""
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        self._buffer.set_waypoints(np.array([[x, y]], dtype=np.float64))
+        frame = str(msg.header.frame_id or "")
+        print(
+            f"[hound_manager] rviz goal: ({x:.2f},{y:.2f}) frame={frame!r}",
+            flush=True,
+        )
+
     def publish_plan(self, path: np.ndarray) -> None:
         out = Path()
         out.header.stamp = self.get_clock().now().to_msg()
@@ -128,7 +144,7 @@ def main() -> None:
     lookahead = as_float(Config["lookahead"])
     wp_radius = as_float(Config["wp_radius"])
     planner_cfg = Config["Planner_config"]
-    hysteresis = float(planner_cfg["experiment_info_default"]["hysteresis"])
+    hysteresis = int(planner_cfg["experiment_info_default"]["hysteresis"])
     default_expansion_limit = int(
         planner_cfg["experiment_info_default"]["max_expansions"]
     )
@@ -159,61 +175,72 @@ def main() -> None:
     pdef_period = 1.0 / max(planner_hz, 0.1)
     track_ref_metric = str(launch_cfg.get("track_ref_metric", "screw")).lower()
     screw_length_m = float(launch_cfg.get("screw_length_m", 1.0))
-    planning_margin_s = float(launch_cfg.get("planning_margin_s", 0.05))
-    plan_start_max_ref_dist_m = float(
-        launch_cfg.get("plan_start_max_ref_dist_m", 2.0)
-    )
-    # Planner traj is timed at Dynamics_config.dt (override via SSoT plan_traj_dt_s).
-    plan_traj_dt_s = float(
-        launch_cfg.get(
-            "plan_traj_dt_s",
-            float(Config.get("Dynamics_config", {}).get("dt", 0.05)),
-        )
-    )
-    planner_dt = 0.0  # EMA of measured query→solution RTT (perf_counter)
-    planner_dt_ema_alpha = 0.9
     goal = None
     current_wp_index = 0
     first_path = False
     goal_reached = False
     last_track_stamp = 0.0
     last_wp_gen = -1
+    last_vis_path: Optional[np.ndarray] = None
+    last_vis_ok = False
+    last_vis_exp = 0
+    # Snapshot of last pdef sent → OpenCV viz (background thread).
+    last_query: Optional[Dict[str, Any]] = None
+    planner_cv_viz = bool(launch_cfg.get("planner_cv_viz", True))
+    vis = PlannerVisWorker(
+        enabled=planner_cv_viz,
+        window_name=str(launch_cfg.get("planner_cv_viz_window", "hound_planner_vis")),
+        map_size=int(launch_cfg.get("planner_cv_viz_size", 480)),
+    )
 
     print(
         f"[hound_manager] up T={timesteps} exp={expansion_limit} "
         f"track_ref={track_ref_metric} L={screw_length_m:.3f} "
-        f"plan_margin={planning_margin_s:.2f}s "
-        f"traj_dt={plan_traj_dt_s:.3f}s "
-        f"max_ref={plan_start_max_ref_dist_m:.2f}m "
-        "(LocalMap native grid, no warp)",
+        f"cv_viz={planner_cv_viz} "
+        "(plan start = live robot, LocalMap native grid)",
         flush=True,
     )
 
-    def _plan_start_horizon_s() -> float:
-        return float(planner_dt) + float(planning_margin_s)
-
-    def _planner_start_state(robot_state: np.ndarray) -> np.ndarray:
-        """Robot state, or traj pose (planner_dt + margin) after closest ref."""
-        yaw = float(robot_state[5]) if robot_state.shape[0] > 5 else 0.0
-        if traj.empty() or traj.robot_too_far_from_ref(
-            robot_state[:2],
-            yaw,
-            max_dist_m=plan_start_max_ref_dist_m,
-            metric=track_ref_metric,
-            screw_length_m=screw_length_m,
-        ):
-            return np.copy(robot_state)
-        ahead = traj.pose_after(
-            robot_state[:2],
-            yaw,
-            dt_ahead_s=_plan_start_horizon_s(),
-            dt_s=plan_traj_dt_s,
-            metric=track_ref_metric,
-            screw_length_m=screw_length_m,
+    def _push_vis(
+        *,
+        path: Optional[np.ndarray],
+        ok: bool,
+        expansions: int,
+        note: str = "",
+        query: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        q = query if query is not None else last_query
+        if q is None:
+            return
+        live = buffer.get_state_copy()
+        if live is not None and live.size >= 2:
+            yaw = float(live[5]) if live.size > 5 else 0.0
+            state_xy_yaw = np.array(
+                [float(live[0]), float(live[1]), yaw], dtype=np.float64
+            )
+        else:
+            start = np.asarray(q["start"], dtype=np.float64).reshape(-1)
+            yaw = float(start[5]) if start.size > 5 else 0.0
+            state_xy_yaw = np.array(
+                [float(start[0]), float(start[1]), yaw], dtype=np.float64
+            )
+        vis.update(
+            PlannerVisFrame(
+                costmap=np.asarray(q["costmap"], dtype=np.float32),
+                height=np.asarray(q["height"], dtype=np.float32),
+                path=None if path is None else np.asarray(path, dtype=np.float64),
+                goal_xy=np.asarray(q["goal"], dtype=np.float64).reshape(-1)[:2],
+                state_xy_yaw=state_xy_yaw,
+                map_center=np.asarray(q["map_center"], dtype=np.float64).reshape(-1)[
+                    :2
+                ],
+                map_res=float(q["map_res"]),
+                wp_radius=float(wp_radius),
+                ok=bool(ok),
+                expansions=int(expansions),
+                note=str(note),
+            )
         )
-        if ahead is None:
-            return np.copy(robot_state)
-        return path_pose_to_start_state(robot_state, ahead)
 
     def _maybe_send_map(dora_node: Node) -> None:
         nonlocal last_map_gen_sent
@@ -237,6 +264,7 @@ def main() -> None:
     def _maybe_send_pdef(dora_node: Node) -> None:
         nonlocal query_outstanding, query_sent_t, goal, current_wp_index
         nonlocal expansion_limit, goal_reached, last_pdef_t, last_wp_gen
+        nonlocal last_query
         now = time.perf_counter()
         if (now - last_pdef_t) < pdef_period:
             return
@@ -272,16 +300,34 @@ def main() -> None:
         )
         goal_reached = bool(success)
         if goal is None or goal_reached:
+            if goal_reached and (now - last_pdef_t) >= pdef_period:
+                # Rate-limit so a too-large wp_radius does not spam.
+                print(
+                    f"[hound_manager] skip plan: within wp_radius of goal "
+                    f"(idx={current_wp_index})",
+                    flush=True,
+                )
+                last_pdef_t = now
             return
-        start = _planner_start_state(state)
+        start = np.copy(state)
         query_t = time.perf_counter()
+        goal_arr = np.asarray(goal, dtype=np.float64)
+        last_query = {
+            "costmap": np.copy(pdef.costmap),
+            "height": np.copy(pdef.height_bev),
+            "map_center": np.copy(pdef.map_center),
+            "map_res": float(pdef.map_res),
+            "start": np.copy(start),
+            "goal": np.copy(goal_arr),
+        }
+        _push_vis(path=None, ok=False, expansions=0, note="query")
         arr, meta = pack_pdef(
             pdef.costmap,
             pdef.height_bev,
             map_center=pdef.map_center,
             map_res=pdef.map_res,
             start=start,
-            goal=np.asarray(goal, dtype=np.float64),
+            goal=goal_arr,
             hysteresis=hysteresis,
             expansion_limit=expansion_limit,
             query_t=query_t,
@@ -290,6 +336,11 @@ def main() -> None:
         query_outstanding = True
         query_sent_t = query_t
         last_pdef_t = now
+        print(
+            f"[hound_manager] pdef sent exp={expansion_limit} "
+            f"goal=({float(goal[0]):.2f},{float(goal[1]):.2f})",
+            flush=True,
+        )
 
     def _maybe_send_track(dora_node: Node) -> None:
         nonlocal last_track_stamp
@@ -320,6 +371,12 @@ def main() -> None:
                 hold = bool(stop or goal_reached)
         arr, meta = pack_track(state, horizon, goal_reached=hold)
         dora_node.send_output("track", arr, meta)
+        if last_query is not None:
+            _push_vis(
+                path=last_vis_path,
+                ok=last_vis_ok,
+                expansions=last_vis_exp,
+            )
 
     try:
         for event in dora:
@@ -333,11 +390,15 @@ def main() -> None:
                     event.get("value"), event.get("metadata") or {}
                 )
                 query_outstanding = False
-                # RTT EMA after unpack (same clock as packed query_t).
-                if query_t > 0.0:
-                    measured_dt = max(0.0, time.perf_counter() - float(query_t))
-                    a = planner_dt_ema_alpha
-                    planner_dt = a * planner_dt + (1.0 - a) * measured_dt
+                last_vis_ok = bool(ok)
+                last_vis_exp = int(expansions)
+                last_vis_path = path if ok else None
+                _push_vis(
+                    path=last_vis_path,
+                    ok=last_vis_ok,
+                    expansions=last_vis_exp,
+                    note="plan",
+                )
                 if ok and path is not None:
                     traj.replace(path)
                     first_path = True
@@ -351,6 +412,7 @@ def main() -> None:
                 _maybe_send_pdef(dora)
                 _maybe_send_track(dora)
     finally:
+        vis.stop()
         ros.destroy_node()
         executor.shutdown()
         if rclpy.ok():

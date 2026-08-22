@@ -25,7 +25,7 @@ def _search(
     costmap: np.ndarray,
     heightmap: np.ndarray,
     map_res: float,
-    hysteresis: float,
+    hysteresis: int,
     expansion_limit: int,
     stop: bool,
     cruise_speed_mps: float,
@@ -66,8 +66,9 @@ def _search(
     goal[2] = float(np.arctan2(dy, dx))
     goal[3] = 0.0 if stop else float(cruise_speed_mps)
 
+    # IGHA* pybind expects int hysteresis_threshold (not float).
     success = planner.search(
-        start, goal, bitmap, expansion_limit, hysteresis, True
+        start, goal, bitmap, int(expansion_limit), int(hysteresis), True
     )
     prof = planner.get_profiler_info()
     expansions = int(prof[7]) if prof is not None and len(prof) > 7 else 0

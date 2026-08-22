@@ -9,7 +9,7 @@ MPPI core lives in the `mppi` package
 ## Graph
 
 ```
-ROS LocalMap / control_state / mission
+ROS LocalMap / control_state / mission Path and RViz /goal_pose
   → manager (CPU crop, world-frame TrajBuffer, update_goal)
       → pdef  ~5 Hz   (start + goal + HxWx2 map)  → planner (IGHA* search)
       ← plan          (world Nx4)
@@ -70,3 +70,4 @@ ros2 launch hound_core hound_core.launch.py
 - `Cost_config.lethal_w` weights the mapper costmap; it does not re-threshold slope.
 - Do not use `IGHAStarMP`; planner is in-process IGHA* in its Dora node.
 - First-slice traj buffer replaces the whole plan on each successful search.
+- Planner start is the live robot (`control_state`). OpenCV box is that pose, not a simulated plant.
