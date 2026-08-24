@@ -8,15 +8,19 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+import math
+
 import numpy as np
 import rclpy
 from dora import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Path
+from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node as RosNode
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import ColorRGBA, Float64MultiArray
+from visualization_msgs.msg import Marker, MarkerArray
 from hound_mapping.msg import LocalMap
 
 from hound_nav.deps_path import setup_dependency_paths
@@ -52,8 +56,13 @@ class ManagerRos(RosNode):
         path_topic = str(launch_cfg.get("path_topic", "/mission/path"))
         goal_topic = str(launch_cfg.get("goal_topic", "/goal_pose"))
         plan_topic = str(launch_cfg.get("plan_topic", "/hound_nav/local_plan"))
+        plan_markers_topic = str(
+            launch_cfg.get("plan_markers_topic", "/hound_nav/local_plan_arrows")
+        )
         qos = qos_profile_sensor_data
-        self.create_subscription(LocalMap, local_map_topic, self._on_local_map, 1)
+        self.create_subscription(
+            LocalMap, local_map_topic, self._on_local_map, qos_profile_sensor_data
+        )
         self.create_subscription(
             Float64MultiArray, state_topic, self._on_control_state, qos
         )
@@ -61,10 +70,14 @@ class ManagerRos(RosNode):
         # RViz "2D Goal Pose" (PoseStamped, reliable). Each click = one-WP mission.
         self.create_subscription(PoseStamped, goal_topic, self._on_goal_pose, 10)
         self._plan_pub = self.create_publisher(Path, plan_topic, 1)
+        self._plan_marker_pub = self.create_publisher(
+            MarkerArray, plan_markers_topic, 1
+        )
+        self._plan_frame = "odom"
         self.get_logger().info(
             f"manager ROS: map={local_map_topic} state={state_topic} "
             f"dims={self._state_dims} wps={path_topic} goal={goal_topic} "
-            f"viz={plan_topic}"
+            f"plan={plan_topic} arrows={plan_markers_topic}"
         )
 
     def _on_local_map(self, msg: LocalMap) -> None:
@@ -120,17 +133,74 @@ class ManagerRos(RosNode):
         )
 
     def publish_plan(self, path: np.ndarray) -> None:
+        """Path: x,y,yaw, stamp=t0+|g|, z=g*time_direction. Arrows: green fwd, blue back."""
+        arr = np.asarray(path, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] < 1:
+            return
+        now = self.get_clock().now()
+        frame = self._plan_frame
         out = Path()
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = "odom"
-        for row in path:
+        out.header.stamp = now.to_msg()
+        out.header.frame_id = frame
+        markers = MarkerArray()
+        wipe = Marker()
+        wipe.header.stamp = out.header.stamp
+        wipe.header.frame_id = frame
+        wipe.ns = "local_plan"
+        wipe.action = Marker.DELETEALL
+        markers.markers.append(wipe)
+        n = int(arr.shape[0])
+        for i, row in enumerate(arr):
+            x = float(row[0])
+            y = float(row[1])
+            yaw = float(row[2]) if row.size > 2 else 0.0
+            signed_t = float(row[-1]) if row.size > 4 else float(i)
+            t_abs = abs(signed_t)
+            fwd = signed_t >= 0.0
+            travel_yaw = yaw if fwd else yaw + math.pi
+            stamp = (now + Duration(seconds=float(t_abs))).to_msg()
+            q = _yaw_to_quat(yaw)
+            q_travel = _yaw_to_quat(travel_yaw)
             ps = PoseStamped()
-            ps.header = out.header
-            ps.pose.position.x = float(row[0])
-            ps.pose.position.y = float(row[1])
-            ps.pose.position.z = float(row[2]) if row.shape[0] > 2 else 0.0
+            ps.header.stamp = stamp
+            ps.header.frame_id = frame
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.position.z = signed_t
+            ps.pose.orientation = q
             out.poses.append(ps)
+            if i + 1 < n:
+                dx = float(arr[i + 1, 0]) - x
+                dy = float(arr[i + 1, 1]) - y
+                step = math.hypot(dx, dy)
+            else:
+                step = 0.25
+            shaft = min(0.55, max(0.18, step * 0.85))
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = frame
+            m.ns = "local_plan"
+            m.id = i
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.pose.position.x = x
+            m.pose.position.y = y
+            m.pose.position.z = 0.12
+            m.pose.orientation = q_travel
+            m.scale.x = shaft
+            m.scale.y = 0.07
+            m.scale.z = 0.07
+            if fwd:
+                m.color = ColorRGBA(r=0.05, g=0.85, b=0.15, a=1.0)
+            else:
+                m.color = ColorRGBA(r=0.15, g=0.40, b=1.0, a=1.0)
+            markers.markers.append(m)
         self._plan_pub.publish(out)
+        self._plan_marker_pub.publish(markers)
+
+
+def _yaw_to_quat(yaw: float) -> Quaternion:
+    return Quaternion(x=0.0, y=0.0, z=math.sin(yaw * 0.5), w=math.cos(yaw * 0.5))
 
 
 def main() -> None:
@@ -148,12 +218,7 @@ def main() -> None:
     default_expansion_limit = int(
         planner_cfg["experiment_info_default"]["max_expansions"]
     )
-    bidirectional = bool(
-        planner_cfg["experiment_info_default"].get("bidirectional", False)
-    )
-    expansion_limit = (
-        default_expansion_limit // 4 if bidirectional else default_expansion_limit
-    )
+    expansion_limit = default_expansion_limit
     unstuck = int(planner_cfg["unstuck_expansions"])
 
     buffer = PDefBuffer(state_dims=int(launch_cfg.get("control_state_dims", 17)))
@@ -209,6 +274,8 @@ def main() -> None:
         note: str = "",
         query: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if not planner_cv_viz:
+            return
         q = query if query is not None else last_query
         if q is None:
             return

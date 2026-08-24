@@ -154,10 +154,10 @@ def pack_plan(
             pad = np.zeros((arr.shape[0], 4), dtype=np.float64)
             pad[:, : arr.shape[1]] = arr
             arr = pad
-        arr = arr[:, :4]
+        # Keep cols after x,y,yaw,v — last is g*time_direction (fwd/back viz).
     meta = {
         "n": int(arr.shape[0]),
-        "cols": 4,
+        "cols": int(arr.shape[1]),
         "success": bool(success),
         "expansions": int(expansions),
         "query_t": float(query_t),

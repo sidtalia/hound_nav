@@ -5,6 +5,18 @@ from __future__ import annotations
 import numpy as np
 
 
+def _project_to_lookahead(pos, wp, lookahead):
+    """If wp is farther than lookahead, snap it onto that circle toward wp."""
+    pos = np.asarray(pos, dtype=np.float64)[:2]
+    wp = np.asarray(wp, dtype=np.float64)[:2].copy()
+    d = float(np.linalg.norm(wp - pos))
+    if d > lookahead and lookahead > 0.0:
+        angle = np.arctan2(wp[1] - pos[1], wp[0] - pos[0])
+        wp[0] = pos[0] + lookahead * np.cos(angle)
+        wp[1] = pos[1] + lookahead * np.sin(angle)
+    return wp
+
+
 def update_goal(
     goal,
     pos,
@@ -14,7 +26,12 @@ def update_goal(
     step_size=1,
     wp_radius=2.0,
 ):
-    """Advance along mission waypoints with lookahead; return (goal_xy, done, index)."""
+    """Advance along mission waypoints; project goal onto the lookahead circle.
+
+    Same carrot as IGHAStar BeamNG ``update_goal``: if the selected waypoint
+    is farther than ``lookahead``, the planner goal is
+    ``pos + lookahead * (wp - pos) / ‖wp - pos‖``.
+    """
     target_WP = np.asarray(target_WP, dtype=np.float64)
     n = int(target_WP.shape[0]) if target_WP.ndim >= 1 else 0
     if n < 1:
@@ -26,10 +43,14 @@ def update_goal(
     if current_wp_index >= n:
         return np.asarray(pos, dtype=np.float64)[:2].copy(), True, n
 
-    if goal is None:
-        return target_WP[current_wp_index, :2].copy(), False, current_wp_index
-
     pos = np.asarray(pos, dtype=np.float64)[:2]
+    if goal is None:
+        return (
+            _project_to_lookahead(pos, target_WP[current_wp_index, :2], lookahead),
+            False,
+            current_wp_index,
+        )
+
     goal = np.asarray(goal, dtype=np.float64)[:2]
     d = float(np.linalg.norm(goal - pos))
     last = n - 1
@@ -48,7 +69,11 @@ def update_goal(
 
     if terminate:
         return pos.copy(), True, n
-    return target_WP[current_wp_index, :2].copy(), False, current_wp_index
+    return (
+        _project_to_lookahead(pos, target_WP[current_wp_index, :2], lookahead),
+        False,
+        current_wp_index,
+    )
 
 
 def wrap_pi(angle: np.ndarray | float) -> np.ndarray | float:

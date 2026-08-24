@@ -11,6 +11,29 @@ import cv2
 import numpy as np
 
 
+def paint_cost_elev_map(
+    costmap: np.ndarray,
+    elevation_map: np.ndarray,
+    map_size: int,
+) -> np.ndarray:
+    """Manager cost/elev paint only (no path / robot). Y-up world, not flipped."""
+    costmap = cv2.resize(costmap, (map_size, map_size))
+    elevation_map = cv2.resize(elevation_map, (map_size, map_size))
+    costmap_color = np.clip(costmap, 0, 255).astype(np.uint8)
+    pink = np.array([255, 105, 180], dtype=np.uint8)
+    white = np.array([255, 255, 255], dtype=np.uint8)
+    color_map = np.zeros((map_size, map_size, 3), dtype=np.uint8)
+    mask_white = costmap_color >= 250
+    color_map[mask_white] = white
+    color_map[~mask_white] = pink
+    elev_norm = np.clip((elevation_map + 4) / 8, 0, 1)
+    elev_uint8 = (elev_norm * 255).astype(np.uint8)
+    elev_color = np.stack([elev_uint8] * 3, axis=-1)
+    display_img = color_map.copy()
+    display_img[mask_white] = elev_color[mask_white]
+    return display_img
+
+
 def visualize_map_with_path(
     costmap: np.ndarray,
     elevation_map: np.ndarray,
@@ -24,26 +47,12 @@ def visualize_map_with_path(
 ) -> np.ndarray:
     """Cost (pink/white) + elev blend, path, goal circle, robot box.
 
+    Same free/lethal paint as IGHAStar ``examples/standalone/utils.py``:
+    cost >= 250 is free (elevation grey); below that is pink (obstacle).
     World XY relative to ``map_center``; image origin after flip matches
     cv2.imshow (top-left) vs planner map (bottom-left).
     """
-    costmap = cv2.resize(costmap, (map_size, map_size))
-    elevation_map = cv2.resize(elevation_map, (map_size, map_size))
-
-    costmap_color = np.clip(costmap, 0, 255).astype(np.uint8)
-    pink = np.array([255, 105, 180], dtype=np.uint8)
-    white = np.array([255, 255, 255], dtype=np.uint8)
-    color_map = np.zeros((map_size, map_size, 3), dtype=np.uint8)
-    mask_white = costmap_color == 255
-    mask_pink = ~mask_white
-    color_map[mask_white] = white
-    color_map[mask_pink] = pink
-
-    elev_norm = np.clip((elevation_map + 4) / 8, 0, 1)
-    elev_uint8 = (elev_norm * 255).astype(np.uint8)
-    elev_color = np.stack([elev_uint8] * 3, axis=-1)
-    display_img = color_map.copy()
-    display_img[mask_white] = elev_color[mask_white]
+    display_img = paint_cost_elev_map(costmap, elevation_map, map_size)
 
     goal_disp = np.asarray(goal[:2], dtype=np.float64) - np.asarray(
         map_center[:2], dtype=np.float64

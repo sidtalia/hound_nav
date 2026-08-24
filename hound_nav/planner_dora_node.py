@@ -94,9 +94,6 @@ def main() -> None:
     bidirectional = bool(
         planner_cfg["experiment_info_default"].get("bidirectional", False)
     )
-    default_exp = int(planner_cfg["experiment_info_default"]["max_expansions"])
-    if bidirectional:
-        planner_cfg["experiment_info_default"]["max_expansions"] = default_exp // 4
 
     planner = None
     dora = Node()
