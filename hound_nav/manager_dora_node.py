@@ -3,6 +3,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Running as a script: sys.path[0] is this directory, so `import hound_nav`
+# would hit the *installed* package. Prefer this checkout.
+_HOUND_NAV_ROOT = Path(__file__).resolve().parent.parent
+if _HOUND_NAV_ROOT.is_dir():
+    sys.path.insert(0, str(_HOUND_NAV_ROOT))
+
 import os
 import threading
 import time
@@ -74,6 +83,16 @@ class ManagerRos(RosNode):
             MarkerArray, plan_markers_topic, 1
         )
         self._plan_frame = "odom"
+        self._logged_map = False
+        self._logged_state = False
+        self._logged_map_skip = False
+        self._logged_state_skip = False
+        self._map_rx_last = 0.0
+        self._map_rx_window_t0 = 0.0
+        self._map_rx_window_n = 0
+        self._map_rx_period_min = 1.0e9
+        self._map_rx_period_max = 0.0
+        self._map_stamp_last = 0.0
         self.get_logger().info(
             f"manager ROS: map={local_map_topic} state={state_topic} "
             f"dims={self._state_dims} wps={path_topic} goal={goal_topic} "
@@ -84,7 +103,20 @@ class ManagerRos(RosNode):
         elev = _img_f32(msg.elevation)
         cost = _img_f32(msg.costmap)
         if elev is None or cost is None or elev.shape != cost.shape:
+            if not self._logged_map_skip:
+                self._logged_map_skip = True
+                enc_e = str(getattr(msg.elevation, "encoding", "?"))
+                enc_c = str(getattr(msg.costmap, "encoding", "?"))
+                self.get_logger().warn(
+                    f"LocalMap ignored: elev={enc_e} {msg.elevation.width}x"
+                    f"{msg.elevation.height} cost={enc_c} "
+                    f"{msg.costmap.width}x{msg.costmap.height} "
+                    "(need 32FC1, same size)"
+                )
             return
+        stamp_sec = float(msg.header.stamp.sec) + 1e-9 * float(
+            msg.header.stamp.nanosec
+        )
         self._buffer.set_local_map(
             LocalMapSnapshot(
                 elevation=elev,
@@ -92,18 +124,67 @@ class ManagerRos(RosNode):
                 origin_x=float(msg.info.origin.position.x),
                 origin_y=float(msg.info.origin.position.y),
                 resolution=float(msg.info.resolution),
-                stamp_sec=float(msg.header.stamp.sec)
-                + 1e-9 * float(msg.header.stamp.nanosec),
+                stamp_sec=stamp_sec,
             )
         )
+        now = time.perf_counter()
+        rx_ms = 0.0
+        if self._map_rx_last > 0.0:
+            rx_ms = (now - self._map_rx_last) * 1000.0
+            if rx_ms < self._map_rx_period_min:
+                self._map_rx_period_min = rx_ms
+            if rx_ms > self._map_rx_period_max:
+                self._map_rx_period_max = rx_ms
+        self._map_rx_last = now
+        stamp_ms = 0.0
+        if self._map_stamp_last > 0.0 and stamp_sec > 0.0:
+            stamp_ms = (stamp_sec - self._map_stamp_last) * 1000.0
+        if stamp_sec > 0.0:
+            self._map_stamp_last = stamp_sec
+        if self._map_rx_window_t0 <= 0.0:
+            self._map_rx_window_t0 = now
+        self._map_rx_window_n += 1
+        win_s = now - self._map_rx_window_t0
+        if win_s >= 1.0 and self._map_rx_window_n >= 2:
+            mean_hz = (self._map_rx_window_n - 1) / win_s
+            line = (
+                f"[hound_manager] local_map rx {mean_hz:.2f} Hz "
+                f"n={self._map_rx_window_n} last={rx_ms:.1f}ms "
+                f"min={self._map_rx_period_min:.1f} max={self._map_rx_period_max:.1f}ms"
+                f" stamp_dt={stamp_ms:.1f}ms"
+            )
+            print(line, flush=True)
+            self.get_logger().info(line)
+            self._map_rx_window_t0 = now
+            self._map_rx_window_n = 1
+            self._map_rx_period_min = 1.0e9
+            self._map_rx_period_max = 0.0
+        if not self._logged_map:
+            self._logged_map = True
+            self.get_logger().info(
+                f"first LocalMap {int(elev.shape[1])}x{int(elev.shape[0])} "
+                f"res={float(msg.info.resolution):.3f}m"
+            )
 
     def _on_control_state(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < self._state_dims:
+            if not self._logged_state_skip:
+                self._logged_state_skip = True
+                self.get_logger().warn(
+                    f"control_state ignored: n={len(msg.data)} "
+                    f"< dims={self._state_dims}"
+                )
             return
         self._buffer.set_state_vector(
             np.asarray(msg.data[: self._state_dims], dtype=np.float64),
             stamp_sec=self.get_clock().now().nanoseconds * 1e-9,
         )
+        if not self._logged_state:
+            self._logged_state = True
+            self.get_logger().info(
+                f"first control_state n={len(msg.data)} "
+                f"xy=({float(msg.data[0]):.2f},{float(msg.data[1]):.2f})"
+            )
 
     def _on_path(self, msg: Path) -> None:
         if not msg.poses:
@@ -127,10 +208,9 @@ class ManagerRos(RosNode):
         y = float(msg.pose.position.y)
         self._buffer.set_waypoints(np.array([[x, y]], dtype=np.float64))
         frame = str(msg.header.frame_id or "")
-        print(
-            f"[hound_manager] rviz goal: ({x:.2f},{y:.2f}) frame={frame!r}",
-            flush=True,
-        )
+        line = f"[hound_manager] rviz goal: ({x:.2f},{y:.2f}) frame={frame!r}"
+        print(line, flush=True)
+        self.get_logger().info(line)
 
     def publish_plan(self, path: np.ndarray) -> None:
         """Path: x,y,yaw, stamp=t0+|g|, z=g*time_direction. Arrows: green fwd, blue back."""
@@ -246,6 +326,7 @@ def main() -> None:
     goal_reached = False
     last_track_stamp = 0.0
     last_wp_gen = -1
+    last_wait_log_t = 0.0
     last_vis_path: Optional[np.ndarray] = None
     last_vis_ok = False
     last_vis_exp = 0
@@ -475,6 +556,22 @@ def main() -> None:
                     expansion_limit = min(expansion_limit * 2, unstuck)
                 continue
             if eid == "tick":
+                miss = (
+                    buffer.missing_inputs()
+                    if hasattr(buffer, "missing_inputs")
+                    else (
+                        (["control_state", "local_map"] if not buffer.ready() else [])
+                        + (["goal"] if buffer.waypoint_generation() == 0 else [])
+                    )
+                )
+                now = time.perf_counter()
+                if miss and (now - last_wait_log_t) >= 2.0:
+                    last_wait_log_t = now
+                    print(
+                        f"[hound_manager] waiting for {', '.join(miss)} "
+                        f"(no pdef until map+state+goal)",
+                        flush=True,
+                    )
                 _maybe_send_map(dora)
                 _maybe_send_pdef(dora)
                 _maybe_send_track(dora)

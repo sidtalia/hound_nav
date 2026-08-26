@@ -179,6 +179,18 @@ class PDefBuffer:
         with self._lock:
             return self._state_valid and self._map is not None
 
+    def missing_inputs(self) -> list[str]:
+        """Names of inputs the planner still needs (empty ⇒ map+state present)."""
+        with self._lock:
+            missing: list[str] = []
+            if not self._state_valid:
+                missing.append("control_state")
+            if self._map is None:
+                missing.append("local_map")
+            if self._target_wp is None or int(self._target_wp.shape[0]) < 1:
+                missing.append("goal")
+            return missing
+
     def snapshot_pdef(
         self,
         goal_xy: Optional[np.ndarray] = None,

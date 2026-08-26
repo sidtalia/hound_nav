@@ -3,6 +3,13 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_HOUND_NAV_ROOT = Path(__file__).resolve().parent.parent
+if _HOUND_NAV_ROOT.is_dir():
+    sys.path.insert(0, str(_HOUND_NAV_ROOT))
+
 import os
 import time
 import traceback
