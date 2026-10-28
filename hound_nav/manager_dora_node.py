@@ -29,7 +29,7 @@ from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node as RosNode
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import ColorRGBA, Float64MultiArray
+from std_msgs.msg import ColorRGBA, Empty, Float64MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from hound_mapping.msg import LocalMap
 
@@ -37,6 +37,7 @@ from hound_nav.deps_path import setup_dependency_paths
 from hound_nav.pdef_buffer import LocalMapSnapshot, PDefBuffer
 from hound_nav.pdef_codec import pack_map, pack_pdef, pack_track, unpack_plan
 from hound_nav.planner_viz import PlannerVisFrame, PlannerVisWorker, car_dims_m
+from hound_nav.track_time import clamp_twist, need_plan, open_loop_command
 from hound_nav.traj_buffer import TrajBuffer
 from hound_nav.utils import update_goal
 
@@ -79,6 +80,8 @@ class ManagerRos(RosNode):
         self.create_subscription(Path, path_topic, self._on_path, 1)
         # RViz "2D Goal Pose" (PoseStamped, reliable). Each click = one-WP mission.
         self.create_subscription(PoseStamped, goal_topic, self._on_goal_pose, 10)
+        cancel_topic = str(launch_cfg.get("cancel_topic", "/hound_nav/cancel"))
+        self.create_subscription(Empty, cancel_topic, self._on_cancel, 10)
         self._plan_pub = self.create_publisher(Path, plan_topic, 1)
         self._plan_marker_pub = self.create_publisher(
             MarkerArray, plan_markers_topic, 1
@@ -87,7 +90,7 @@ class ManagerRos(RosNode):
             launch_cfg.get("plan_diagnostics_topic", "/hound_nav/planner_diagnostics")
         )
         self._plan_diag_pub = self.create_publisher(DiagnosticArray, diag_topic, 10)
-        self._plan_frame = "odom"
+        self._plan_frame = str(launch_cfg.get("plan_frame", "odom"))
         self._logged_map = False
         self._logged_state = False
         self._logged_map_skip = False
@@ -103,7 +106,8 @@ class ManagerRos(RosNode):
         self.get_logger().info(
             f"manager ROS: map={local_map_topic} state={state_topic} "
             f"dims={self._state_dims} wps={path_topic} goal={goal_topic} "
-            f"plan={plan_topic} arrows={plan_markers_topic}"
+            f"plan={plan_topic} frame={self._plan_frame} cancel={cancel_topic} "
+            f"arrows={plan_markers_topic}"
         )
 
     def _on_local_map(self, msg: LocalMap) -> None:
@@ -212,7 +216,12 @@ class ManagerRos(RosNode):
         """RViz 2D Goal Pose: replace mission with this one waypoint."""
         x = float(msg.pose.position.x)
         y = float(msg.pose.position.y)
-        self._buffer.set_waypoints(np.array([[x, y]], dtype=np.float64))
+        q = msg.pose.orientation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        self._buffer.set_waypoints(np.array([[x, y, yaw]], dtype=np.float64))
         frame = str(msg.header.frame_id or "")
         now = time.perf_counter()
         same = (
@@ -225,9 +234,29 @@ class ManagerRos(RosNode):
         self._goal_log_t = now
         self._goal_log_xy = (x, y)
         print(
-            f"[hound_manager] rviz goal: ({x:.2f},{y:.2f}) frame={frame!r}",
+            f"[hound_manager] rviz goal: ({x:.2f},{y:.2f},{math.degrees(yaw):.0f} deg) frame={frame!r}",
             flush=True,
         )
+
+    def _on_cancel(self, _msg: Empty) -> None:
+        self._buffer.clear_waypoints()
+        print("[hound_manager] goal cancelled", flush=True)
+
+    def clear_plan(self) -> None:
+        """Empty path and delete the arrows, so a viewer drops the old reference."""
+        now = self.get_clock().now().to_msg()
+        out = Path()
+        out.header.stamp = now
+        out.header.frame_id = self._plan_frame
+        self._plan_pub.publish(out)
+        wipe = Marker()
+        wipe.header.stamp = now
+        wipe.header.frame_id = self._plan_frame
+        wipe.ns = "local_plan"
+        wipe.action = Marker.DELETEALL
+        markers = MarkerArray()
+        markers.markers.append(wipe)
+        self._plan_marker_pub.publish(markers)
 
     def publish_plan(self, path: np.ndarray, stamp=None):
         """Path: x,y,yaw, stamp=t0+|g|, z=g*time_direction. Arrows: green fwd, blue back."""
@@ -343,6 +372,20 @@ def main() -> None:
     launch_cfg = load_hound_nav_config()
     Config = stack_config(launch_cfg)
     timesteps = int(Config["MPPI_config"]["TIMESTEPS"])
+    # One MPPI step integrates one Dynamics dt, and each path row is one
+    # planner step of that same dt, so the window steps one row per MPPI step.
+    stride = 1
+    sampling_cfg = Config["Sampling_config"]
+    max_vel = float(sampling_cfg.get("max_vel", 0.0))
+    min_vel = float(sampling_cfg.get("min_vel", 0.0))
+    vy_max = float(sampling_cfg.get("vy_max", 0.0))
+    max_omega = float(sampling_cfg.get("max_omega", 0.0))
+    # ponytail: control_state carries wall time, not physics time. Each message
+    # is one gates_floor_sim step (its --dt, 0.02). Count those.
+    plant_dt = float(launch_cfg.get("plant_dt", 0.02))
+    open_loop = bool(launch_cfg.get("open_loop", False))
+    track_metric = str(launch_cfg.get("track_ref_metric", "screw"))
+    screw_length_m = float(launch_cfg.get("screw_length_m", 1.0))
     lookahead = as_float(Config["lookahead"])
     wp_radius = as_float(Config["wp_radius"])
     planner_cfg = Config["Planner_config"]
@@ -366,18 +409,19 @@ def main() -> None:
     dora = Node()
     last_map_gen_sent = -1
     query_outstanding = False
+    query_wp_gen = -1
     query_sent_t = 0.0
     query_timeout_s = 5.0
     last_pdef_t = 0.0
     planner_hz = float(launch_cfg.get("planner_hz", 5.0))
     pdef_period = 1.0 / max(planner_hz, 0.1)
-    track_ref_metric = str(launch_cfg.get("track_ref_metric", "screw")).lower()
-    screw_length_m = float(launch_cfg.get("screw_length_m", 1.0))
     goal = None
     current_wp_index = 0
     first_path = False
     goal_reached = False
     last_track_stamp = 0.0
+    t_world = 0.0
+    query_clock = 0.0
     last_wp_gen = -1
     last_wait_log_t = 0.0
     last_vis_path: Optional[np.ndarray] = None
@@ -395,7 +439,8 @@ def main() -> None:
     print(
         f"[hound_manager] up T={timesteps} exp={expansion_limit} "
         f"wp_radius={wp_radius:.2f}m "
-        f"track_ref={track_ref_metric} L={screw_length_m:.3f} "
+        f"track={track_metric} L={screw_length_m:.2f}m "
+        f"open_loop={open_loop} "
         f"cv_viz={planner_cv_viz} "
         "(plan start = live robot, LocalMap native grid)",
         flush=True,
@@ -468,7 +513,7 @@ def main() -> None:
     def _maybe_send_pdef(dora_node: Node) -> None:
         nonlocal query_outstanding, query_sent_t, goal, current_wp_index
         nonlocal expansion_limit, goal_reached, last_pdef_t, last_wp_gen
-        nonlocal last_query
+        nonlocal last_query, query_clock, query_wp_gen
         now = time.perf_counter()
         if (now - last_pdef_t) < pdef_period:
             return
@@ -485,6 +530,8 @@ def main() -> None:
             goal = None
             current_wp_index = 0
             goal_reached = False
+            traj.clear()
+            ros.clear_plan()
             print(
                 f"[hound_manager] new mission (gen={wp_gen}); reset goal index",
                 flush=True,
@@ -494,6 +541,7 @@ def main() -> None:
             return
         state = pdef.state
         pos = np.copy(state[:2])
+        yaw = float(state[5]) if state.size > 5 else 0.0
         goal, success, current_wp_index = update_goal(
             goal,
             pos,
@@ -501,13 +549,19 @@ def main() -> None:
             current_wp_index,
             lookahead,
             wp_radius=wp_radius,
+            yaw=yaw,
+            screw_length_m=screw_length_m,
         )
         goal_reached = bool(success)
+        # A path still ahead of the clock is the reference. Do not replace it
+        # on the planner timer.
+        if not need_plan(traj.get(), t_world, stride):
+            return
         if goal is None or goal_reached:
             if goal_reached and (now - last_pdef_t) >= pdef_period:
                 # Rate-limit so a too-large wp_radius does not spam.
                 print(
-                    f"[hound_manager] skip plan: within wp_radius of goal "
+                    f"[hound_manager] skip plan: screw dist within {wp_radius:.2f} of goal "
                     f"(idx={current_wp_index})",
                     flush=True,
                 )
@@ -515,7 +569,18 @@ def main() -> None:
             return
         start = np.copy(state)
         query_t = time.perf_counter()
-        goal_arr = np.asarray(goal, dtype=np.float64)
+        goal_arr = np.asarray(goal, dtype=np.float64).reshape(-1)[:2]
+        wp = pdef.target_wp
+        if (
+            wp is not None
+            and wp.ndim == 2
+            and wp.shape[1] >= 3
+            and 0 <= int(current_wp_index) < len(wp)
+        ):
+            goal_arr = np.array(
+                [goal_arr[0], goal_arr[1], float(wp[int(current_wp_index), 2])],
+                dtype=np.float64,
+            )
         last_query = {
             "costmap": np.copy(pdef.costmap),
             "height": np.copy(pdef.height_bev),
@@ -538,7 +603,9 @@ def main() -> None:
         )
         dora_node.send_output("pdef", arr, meta)
         query_outstanding = True
+        query_wp_gen = int(wp_gen)
         query_sent_t = query_t
+        query_clock = float(t_world)
         last_pdef_t = now
         if not hasattr(_maybe_send_pdef, "_log_t"):
             _maybe_send_pdef._log_t = 0.0
@@ -551,7 +618,7 @@ def main() -> None:
             )
 
     def _maybe_send_track(dora_node: Node) -> None:
-        nonlocal last_track_stamp
+        nonlocal last_track_stamp, t_world
         state = buffer.get_state_copy()
         if state is None:
             return
@@ -559,25 +626,39 @@ def main() -> None:
         if stamp <= last_track_stamp:
             return
         last_track_stamp = stamp
+        t_world += plant_dt
         world = traj.get()
+        open_cmd = None
         if world is None:
             horizon = np.zeros((timesteps, 4), dtype=np.float64)
             hold = True
         else:
-            yaw = float(state[5]) if state.shape[0] > 5 else 0.0
-            horizon, stop = traj.horizon(
+            # Closest row in SE(2): a halted robot on a fresh plan stays on the start.
+            horizon, _near_end = traj.horizon(
                 state[:2],
                 timesteps,
-                yaw=yaw,
-                metric=track_ref_metric,
+                yaw=float(state[5]) if state.size > 5 else 0.0,
+                metric=track_metric,
                 screw_length_m=screw_length_m,
             )
             if horizon is None:
                 horizon = np.zeros((timesteps, 4), dtype=np.float64)
                 hold = True
             else:
-                hold = bool(stop or goal_reached)
-        arr, meta = pack_track(state, horizon, goal_reached=hold)
+                hold = bool(goal_reached)
+            # ponytail: the plant command is the path row's body vx, vy, omega.
+            # The IGHA* control tape is acceleration and is not on this message.
+            if open_loop and world.shape[1] >= 6:
+                cmd = open_loop_command(world, world[:, 3:6], t_world)
+                if cmd is not None:
+                    open_cmd = clamp_twist(cmd, max_vel, vy_max, max_omega, min_vel)
+        arr, meta = pack_track(
+            state,
+            horizon,
+            goal_reached=hold,
+            open_loop=open_loop,
+            open_cmd=open_cmd,
+        )
         dora_node.send_output("track", arr, meta)
         if last_query is not None:
             _push_vis(
@@ -598,6 +679,10 @@ def main() -> None:
                     event.get("value"), event.get("metadata") or {}
                 )
                 query_outstanding = False
+                if buffer.waypoint_generation() != query_wp_gen:
+                    print("[hound_manager] dropped a plan for a cancelled goal", flush=True)
+                    ros.clear_plan()
+                    continue
                 last_vis_ok = bool(ok)
                 last_vis_exp = int(expansions)
                 last_vis_path = path if ok else None
@@ -609,7 +694,12 @@ def main() -> None:
                 )
                 stamp = ros.get_clock().now()
                 if ok and path is not None:
-                    traj.replace(path)
+                    stored = np.array(path, dtype=np.float64, copy=True)
+                    # g on a new search starts at 0. Shift it onto this clock,
+                    # the same way the Push-T planner adds t_world at query time.
+                    if stored.ndim == 2 and stored.shape[1] >= 5 and stored.shape[0] >= 1:
+                        stored[:, -1] = stored[:, -1] + float(query_clock)
+                    traj.replace(stored)
                     first_path = True
                     expansion_limit = default_expansion_limit
                     ros.publish_plan(path, stamp=stamp)

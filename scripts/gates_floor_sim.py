@@ -6,8 +6,10 @@ else (occupied and unknown) = 0. MuJoCo is a planar body. It publishes the
 17-vector control_state (pose + body twist) and subscribes to the nav twist
 (linear.x, linear.y, angular.z). No cameras, no arms.
 
-Viser (default :8081): click sets the goal, shift-click sets the robot xy.
-The yaw slider is the robot heading used on that shift-click.
+Viser (default :8081): the floor image is the LocalMap crop published to the
+planner and MPPI, one pixel per cell. Drag on the map sets the goal pose:
+the press is the position and the drag direction is the heading.
+Shift-click sets the robot pose; the yaw slider is that heading.
 
   python3 scripts/gates_floor_sim.py --config ../config/gates_r6.yaml
   python3 scripts/gates_floor_sim.py --check
@@ -139,24 +141,6 @@ def free_spawn(cost: np.ndarray, ox: float, oy: float, res: float) -> tuple[floa
     return pixel_center(float(xs[k]), float(ys[k]), ox, oy, res, cost.shape[0])
 
 
-def wall_points(cost: np.ndarray, ox: float, oy: float, res: float, cap: int = 80000):
-    lethal = cost == 0
-    step = 4
-    while step < 64:
-        sub = lethal[::step, ::step]
-        if int(sub.sum()) <= cap:
-            break
-        step *= 2
-    rr, cc = np.nonzero(lethal[::step, ::step])
-    cols = cc.astype(np.float64) * step
-    rows = rr.astype(np.float64) * step
-    h = cost.shape[0]
-    x = ox + (cols + 0.5) * res
-    y = oy + ((h - 1 - rows) + 0.5) * res
-    pts = np.stack([x, y, np.zeros_like(x)], axis=1).astype(np.float32)
-    return pts, step * res
-
-
 def _segs(xy, z: float):
     xy = np.asarray(xy, np.float32)
     if xy.ndim != 2 or xy.shape[0] < 2:
@@ -166,6 +150,47 @@ def _segs(xy, z: float):
     a[:, 1, :2] = xy[1:]
     a[:, :, 2] = z
     return a
+
+
+def _R_from_wxyz(wxyz) -> np.ndarray:
+    """Camera-to-world rotation. Columns are right, down, and look."""
+    w, x, y, z = (float(v) for v in wxyz)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def ground_from_screen(client, uv) -> np.ndarray | None:
+    """Where the pointer ray hits z=0. ``uv`` is OpenCV-normalized, (0, 0) top-left."""
+    try:
+        cam = client.camera
+        width = int(cam.image_width)
+        height = int(cam.image_height)
+        fov = float(cam.fov)
+        origin = np.asarray(cam.position, dtype=np.float64)
+        wxyz = np.asarray(cam.wxyz, dtype=np.float64)
+    except AssertionError:
+        return None
+    if width < 2 or height < 2 or fov <= 1e-6:
+        return None
+    fy = (0.5 * height) / math.tan(0.5 * fov)
+    u = float(uv[0]) * width
+    v = float(uv[1]) * height
+    direction = _R_from_wxyz(wxyz) @ np.array(
+        [(u - 0.5 * width) / fy, (v - 0.5 * height) / fy, 1.0],
+        dtype=np.float64,
+    )
+    if abs(float(direction[2])) < 1e-8:
+        return None
+    t = -float(origin[2]) / float(direction[2])
+    if t <= 0.0:
+        return None
+    return origin + t * direction
 
 
 def ray_z0(origin, direction):
@@ -325,8 +350,6 @@ def main() -> None:
 
     server = viser.ViserServer(port=args.viser_port)
     server.scene.set_up_direction("+z")
-    pts, spacing = wall_points(cost, ox, oy, res)
-    server.scene.add_point_cloud("/walls", pts, (40, 40, 40), point_size=float(spacing))
     cx = ox + 0.5 * cost.shape[1] * res
     cy = oy + 0.5 * cost.shape[0] * res
     server.initial_camera.position = (cx, cy - 20.0, 40.0)
@@ -348,8 +371,8 @@ def main() -> None:
     )
     yaw_ui = server.gui.add_slider("robot yaw deg", min=-180.0, max=180.0, step=1.0, initial_value=0.0)
     server.gui.add_markdown(
-        "click = goal · shift-click = robot pose\n\n"
-        "yellow = heading · green = plan · orange = best MPPI rollouts"
+        "drag on the map = goal pose · shift-click = robot pose\n\n"
+        "the drag direction is the goal heading. yellow = robot (yaw slider) · red = goal · green = plan · orange = best MPPI rollouts"
     )
     drawn = {}
 
@@ -363,23 +386,36 @@ def main() -> None:
             name, segs, color, line_width=width
         )
 
-    def _click(ev, place_robot: bool) -> None:
+    @server.scene.on_click(modifier="shift")
+    def _pose(ev):
         hit = ray_z0(ev.ray_origin, ev.ray_direction)
         if hit is None:
             return
         with lock:
-            if place_robot:
-                pending["pose"] = (float(hit[0]), float(hit[1]), math.radians(float(yaw_ui.value)))
-            else:
-                pending["goal"] = (float(hit[0]), float(hit[1]))
+            pending["pose"] = (float(hit[0]), float(hit[1]), math.radians(float(yaw_ui.value)))
 
-    @server.scene.on_click()
-    def _goal(ev):
-        _click(ev, False)
-
-    @server.scene.on_click(modifier="shift")
-    def _pose(ev):
-        _click(ev, True)
+    async def _on_goal_drag(ev) -> None:
+        nonlocal goal_vis, goal_committed
+        # Press is the position. The pointer's ground hit, not the camera drag
+        # plane, is the heading, same as an RViz 2D pose arrow.
+        hit = ground_from_screen(ev.client, ev.end_screen_pos)
+        if hit is None:
+            return
+        x0 = float(ev.start_position[0])
+        y0 = float(ev.start_position[1])
+        dx = float(hit[0]) - x0
+        dy = float(hit[1]) - y0
+        if dx * dx + dy * dy < 0.25 * 0.25:
+            if ev.phase == "end":
+                with lock:
+                    goal_vis = goal_committed
+            return
+        pose = (x0, y0, math.atan2(dy, dx))
+        with lock:
+            goal_vis = pose
+            if ev.phase == "end":
+                goal_committed = pose
+                pending["goal"] = pose
 
     print(f"viser http://0.0.0.0:{args.viser_port}", flush=True)
 
@@ -396,6 +432,9 @@ def main() -> None:
 
     next_map = 0.0
     next_vis = 0.0
+    map_h = None
+    goal_vis = None
+    goal_committed = None
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.0)
@@ -446,6 +485,29 @@ def main() -> None:
                 lm.elevation = f32_image(elev, stamp)
                 lm.costmap = f32_image(elev_c, stamp)
                 map_pub.publish(lm)
+                # Same array the planner and MPPI just received. Row 0 is min Y;
+                # Viser puts image row 0 on the -Y side of the plane.
+                rgb = np.repeat(
+                    np.clip(elev_c, 0, 255).astype(np.uint8)[:, :, None], 3, axis=2
+                )
+                side_x = float(elev_c.shape[1]) * float(args.map_res)
+                side_y = float(elev_c.shape[0]) * float(args.map_res)
+                center = (origin_x + 0.5 * side_x, origin_y + 0.5 * side_y, 0.0)
+                if map_h is None:
+                    map_h = server.scene.add_image(
+                        "/map",
+                        rgb,
+                        side_x,
+                        side_y,
+                        format="png",
+                        cast_shadow=False,
+                        receive_shadow=False,
+                        position=center,
+                    )
+                    map_h.on_drag(_on_goal_drag)
+                else:
+                    map_h.image = rgb
+                    map_h.position = center
 
             if goal is not None:
                 g = PoseStamped()
@@ -453,11 +515,18 @@ def main() -> None:
                 g.header.frame_id = "odom"
                 g.pose.position.x = goal[0]
                 g.pose.position.y = goal[1]
-                g.pose.orientation.w = 1.0
+                qw, qx, qy, qz = yaw_quat(goal[2])
+                g.pose.orientation.w = qw
+                g.pose.orientation.x = qx
+                g.pose.orientation.y = qy
+                g.pose.orientation.z = qz
                 goal_pub.publish(g)
                 goal_h.position = (goal[0], goal[1], 0.02)
                 goal_h.visible = True
-                print(f"goal ({goal[0]:.2f}, {goal[1]:.2f})", flush=True)
+                print(
+                    f"goal ({goal[0]:.2f}, {goal[1]:.2f}, {math.degrees(goal[2]):.0f} deg)",
+                    flush=True,
+                )
             if pose is not None:
                 print(f"pose ({pose[0]:.2f}, {pose[1]:.2f}, {math.degrees(pose[2]):.0f} deg)", flush=True)
 
@@ -475,6 +544,24 @@ def main() -> None:
                     (255, 210, 40),
                     6,
                 )
+                with lock:
+                    shown = None if goal_vis is None else tuple(goal_vis)
+                if shown is None:
+                    _draw("/goal_heading", None, (220, 40, 40), 6)
+                else:
+                    gx, gy, gyaw = shown
+                    goal_h.position = (gx, gy, 0.02)
+                    goal_h.visible = True
+                    gc, gs = math.cos(gyaw), math.sin(gyaw)
+                    _draw(
+                        "/goal_heading",
+                        _segs(
+                            np.array([[gx, gy], [gx + 0.7 * gc, gy + 0.7 * gs]], np.float32),
+                            0.18,
+                        ),
+                        (220, 40, 40),
+                        6,
+                    )
                 with lock:
                     plan = None if viz["plan"] is None else viz["plan"].copy()
                     mppi, mppi_c = viz["mppi"], viz["mppi_c"]

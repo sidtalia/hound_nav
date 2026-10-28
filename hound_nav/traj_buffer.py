@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from hound_nav.track_time import ref_window
 from hound_nav.utils import pose_distances
 
 
@@ -194,3 +195,29 @@ class TrajBuffer:
                 out[len(avail) :] = out[len(avail) - 1]
         stop = ref_i >= len(body) - 10
         return out, stop
+
+    def time_horizon(
+        self,
+        pos_xy: np.ndarray,
+        t_now: float,
+        timesteps: int,
+        stride: int = 1,
+    ) -> Optional[np.ndarray]:
+        """Body-relative window on ``path[:, -1]`` (``g``), state columns only.
+
+        xy is shifted into the robot frame. Yaw and body velocity stay as stored
+        so the controller can put the window back into the map frame.
+        """
+        path = self._path
+        if path is None or len(path) < 1 or int(timesteps) < 1 or path.shape[1] < 2:
+            return None
+        # ponytail: g is one stamp per edge, shared by that edge's intermediates.
+        window = np.array(
+            ref_window(path, float(t_now), int(timesteps), int(stride)),
+            dtype=np.float64,
+            copy=True,
+        )
+        pos = np.asarray(pos_xy, dtype=np.float64).reshape(2)
+        window[:, 0] -= float(pos[0])
+        window[:, 1] -= float(pos[1])
+        return window

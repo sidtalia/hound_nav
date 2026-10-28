@@ -171,6 +171,14 @@ class PDefBuffer:
             self._target_wp = wp
             self._wp_gen += 1
 
+    def clear_waypoints(self) -> None:
+        """Drop the mission. The next track has no path, so the controller halts."""
+        with self._lock:
+            if self._target_wp is None:
+                return
+            self._target_wp = None
+            self._wp_gen += 1
+
     def waypoint_generation(self) -> int:
         with self._lock:
             return self._wp_gen

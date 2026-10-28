@@ -130,9 +130,10 @@ def main() -> None:
     def _publish(act: np.ndarray) -> None:
         if nu == 3:
             msg = Twist()
-            msg.linear.x = float(act[0])
-            msg.linear.y = float(act[1])
-            msg.angular.z = float(act[2])
+            # shortcut: debug gain on the wire only, remove when the base tracks ~0.1 m/s.
+            msg.linear.x = float(act[0]) * 5.0
+            msg.linear.y = float(act[1]) * 5.0
+            msg.angular.z = float(act[2]) * 5.0
         else:
             msg = AckermannDriveStamped()
             msg.header.stamp = ros.get_clock().now().to_msg()
@@ -226,6 +227,18 @@ def main() -> None:
             tr = unpack_track(event.get("value"), event.get("metadata") or {})
         except Exception:
             traceback.print_exc()
+            continue
+
+        if tr.get("open_loop"):
+            # Past the last stamp, open_cmd is missing. Publish zeros.
+            # Do not hold the previous twist.
+            cmd = tr.get("open_cmd")
+            action[:] = 0.0
+            if not tr["goal_reached"] and cmd is not None:
+                c = np.asarray(cmd, dtype=np.float64).reshape(-1)
+                n = min(int(action.size), int(c.size))
+                action[:n] = c[:n]
+            _publish(action)
             continue
 
         if tr["goal_reached"]:

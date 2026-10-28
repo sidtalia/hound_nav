@@ -69,7 +69,10 @@ def _search(
     yaw = float(start_state[5])
     dx = float(goal[0] - start[0])
     dy = float(goal[1] - start[1])
-    goal_yaw = float(np.arctan2(dy, dx))
+    # A clicked pose carries its own heading. Otherwise aim along the goal bearing.
+    goal_yaw = (
+        float(goal_xy[2]) if goal_xy.size >= 3 else float(np.arctan2(dy, dx))
+    )
     if n == 6:
         start[2] = yaw
         start[3] = float(start_state[6])

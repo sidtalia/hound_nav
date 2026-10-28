@@ -134,7 +134,6 @@ __global__ void holonomic_tracking_cost_kernel(
     pos_w * pos_err + heading_w * yaw_err
     + speed_w * vx_err + vy_w * vy_err + omega_w * om_err;
   running = running * scaling[t] + roll_ditch;
-  if (pos_err < 1.0f) constraint = 0.0f;
 
   atomicAdd(out_cost + k, (running + constraint) * inv_M);
   atomicAdd(out_cons + k, constraint * inv_M);

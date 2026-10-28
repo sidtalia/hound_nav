@@ -17,6 +17,24 @@ def _project_to_lookahead(pos, wp, lookahead):
     return wp
 
 
+def _at_waypoint(pos, yaw, wp_row, wp_radius, screw_length_m) -> bool:
+    """True when screw distance to this waypoint is inside ``wp_radius``.
+
+    A row with no yaw falls back to planar distance.
+    """
+    row = np.asarray(wp_row, dtype=np.float64).reshape(1, -1)
+    dist = float(
+        pose_distances(
+            row,
+            pos,
+            float(yaw),
+            metric="screw",
+            screw_length_m=screw_length_m,
+        )[0]
+    )
+    return dist < float(wp_radius)
+
+
 def update_goal(
     goal,
     pos,
@@ -25,12 +43,15 @@ def update_goal(
     lookahead,
     step_size=1,
     wp_radius=2.0,
+    yaw=0.0,
+    screw_length_m=1.0,
 ):
     """Advance along mission waypoints; project goal onto the lookahead circle.
 
     Same carrot as IGHAStar BeamNG ``update_goal``: if the selected waypoint
     is farther than ``lookahead``, the planner goal is
-    ``pos + lookahead * (wp - pos) / ‖wp - pos‖``.
+    ``pos + lookahead * (wp - pos) / ‖wp - pos‖``. Arrival is screw distance
+    to the waypoint pose, so a heading error keeps the goal open.
     """
     target_WP = np.asarray(target_WP, dtype=np.float64)
     n = int(target_WP.shape[0]) if target_WP.ndim >= 1 else 0
@@ -56,14 +77,18 @@ def update_goal(
     last = n - 1
 
     # Arrived at final waypoint → done (do not bump index past end for next tick).
-    if current_wp_index >= last and d < wp_radius:
+    if current_wp_index >= last and _at_waypoint(
+        pos, yaw, target_WP[current_wp_index], wp_radius, screw_length_m
+    ):
         return pos.copy(), True, n
 
     terminate = False
     while d < lookahead and current_wp_index < last:
         current_wp_index = min(current_wp_index + step_size, last)
         d = float(np.linalg.norm(target_WP[current_wp_index, :2] - pos))
-        if current_wp_index >= last and d < wp_radius:
+        if current_wp_index >= last and _at_waypoint(
+            pos, yaw, target_WP[current_wp_index], wp_radius, screw_length_m
+        ):
             terminate = True
             break
 

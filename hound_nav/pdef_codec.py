@@ -99,7 +99,7 @@ def pack_pdef(
         "map_res": float(map_res),
         "map_center": np.asarray(map_center, dtype=np.float64).reshape(-1).tolist(),
         "start": np.asarray(start, dtype=np.float64).reshape(-1).tolist(),
-        "goal": np.asarray(goal, dtype=np.float64).reshape(-1)[:2].tolist(),
+        "goal": np.asarray(goal, dtype=np.float64).reshape(-1).tolist(),
         "hysteresis": int(hysteresis),
         "expansion_limit": int(expansion_limit),
         "state_dims": int(np.asarray(start).reshape(-1).size),
@@ -128,7 +128,7 @@ def unpack_pdef(buf: Any, meta: Dict[str, Any]) -> Dict[str, Any]:
         "map_center": np.asarray(meta.get("map_center", [0.0, 0.0]), dtype=np.float64),
         "map_res": float(meta.get("map_res", 0.25)),
         "start": start[:state_dims].copy(),
-        "goal": goal[:2].copy(),
+        "goal": goal.copy(),
         "hysteresis": int(meta.get("hysteresis", 100)),
         "expansion_limit": int(meta.get("expansion_limit", 5000)),
         "state_dims": state_dims,
@@ -206,6 +206,8 @@ def pack_track(
     reference: np.ndarray,
     *,
     goal_reached: bool,
+    open_loop: bool = False,
+    open_cmd: Optional[np.ndarray] = None,
 ) -> Tuple[pa.Array, Dict[str, Any]]:
     st = np.ascontiguousarray(state, dtype=np.float64).reshape(-1)
     state_dims = int(st.size)
@@ -220,7 +222,11 @@ def pack_track(
         "cols": cols,
         "state_dims": state_dims,
         "goal_reached": bool(goal_reached),
+        "open_loop": bool(open_loop),
     }
+    if open_cmd is not None:
+        cmd = np.asarray(open_cmd, dtype=np.float64).reshape(-1)
+        meta["open_cmd"] = [float(x) for x in cmd[:3]]
     return _arrow_f64(packed), meta
 
 
@@ -233,8 +239,14 @@ def unpack_track(buf: Any, meta: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("invalid track buffer")
     state = flat[:state_dims].copy()
     ref = flat[state_dims : state_dims + t * cols].reshape(t, cols)
-    return {
+    out = {
         "state": state,
         "reference": ref,
         "goal_reached": bool(meta.get("goal_reached", False)),
+        "open_loop": bool(meta.get("open_loop", False)),
     }
+    if "open_cmd" in meta and meta["open_cmd"] is not None:
+        out["open_cmd"] = np.asarray(meta["open_cmd"], dtype=np.float64).reshape(-1)
+    else:
+        out["open_cmd"] = None
+    return out
