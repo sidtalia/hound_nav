@@ -18,7 +18,7 @@ import traceback
 from typing import Any, Dict
 
 from hound_nav.cuda_cache import ensure_torch_extensions_dir
-from hound_nav.deps_path import setup_dependency_paths
+from hound_nav.deps_path import load_class, setup_dependency_paths
 
 _jit_dir = ensure_torch_extensions_dir()
 print(f"[hound_controller] TORCH_EXTENSIONS_DIR={_jit_dir}", flush=True)
@@ -27,6 +27,9 @@ import numpy as np
 import rclpy
 import torch
 from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import Point, Twist
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 from dora import Node
 from rclpy.node import Node as RosNode
 from rclpy.qos import qos_profile_sensor_data
@@ -52,6 +55,7 @@ def main() -> None:
     Dynamics_config["throttle_to_wheelspeed"] = 1.0
     Dynamics_config["steering_max"] = 1.0
     cmd_topic = str(launch_cfg.get("cmd_topic", "/hound_nav/cmd_ackermann"))
+    nu = int(Sampling_config["control_dim"])
 
     if "steer_lim" in Sampling_config:
         steer_lim = float(Sampling_config["steer_lim"])
@@ -66,9 +70,11 @@ def main() -> None:
     # waits (no manager ticks → goal sits in the buffer with no pdef/plan).
     rclpy.init()
     ros = RosNode("hound_nav_controller")
-    cmd_pub = ros.create_publisher(
-        AckermannDriveStamped, cmd_topic, qos_profile_sensor_data
-    )
+    cmd_type = Twist if nu == 3 else AckermannDriveStamped
+    cmd_pub = ros.create_publisher(cmd_type, cmd_topic, qos_profile_sensor_data)
+    viz_k = int(MPPI_config.get("viz_k", 0))
+    viz_pub = ros.create_publisher(MarkerArray, "/hound_nav/mppi_topk", 1)
+    viz_next = 0.0
     dora = Node()
     print(
         "[hound_controller] dora registered; compiling CUDA MPPI "
@@ -88,18 +94,17 @@ def main() -> None:
             pass
 
     from mppi.MPPI import MPPI
-    from mppi.Dynamics.SimpleCarDynamicsTCUDA import SimpleCarDynamics
-    from mppi.Sampling.Delta_Sampling import Delta_Sampling
-    from hound_nav.trackingCostCUDA import SimpleCarCost
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        raise RuntimeError("mppi SimpleCarDynamicsTCUDA requires CUDA")
     dtype = torch.float32
     t_jit = time.perf_counter()
-    costs = SimpleCarCost(Cost_config, Map_config, device=device)
-    sampling = Delta_Sampling(Sampling_config, MPPI_config, device=device)
-    dynamics = SimpleCarDynamics(
+    costs = load_class(Cost_config["file"], Cost_config["class"])(
+        Cost_config, Map_config, device=device
+    )
+    sampling = load_class(Sampling_config["file"], Sampling_config["class"])(
+        Sampling_config, MPPI_config, device=device
+    )
+    dynamics = load_class(Dynamics_config["file"], Dynamics_config["class"])(
         Dynamics_config, Map_config, MPPI_config, device=device
     )
     controller = MPPI(dynamics, costs, sampling, MPPI_config, device)
@@ -113,7 +118,7 @@ def main() -> None:
 
     last_map_gen = -1
     map_center = np.zeros(2, dtype=np.float64)
-    action = np.zeros(2, dtype=np.float64)
+    action = np.zeros(nu, dtype=np.float64)
     cooldown_until = 0.0
     map_ready = False
     dt_sum = 0.0
@@ -123,13 +128,62 @@ def main() -> None:
     cv_log_t = 0.0
 
     def _publish(act: np.ndarray) -> None:
-        msg = AckermannDriveStamped()
-        msg.header.stamp = ros.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.drive.steering_angle = float(np.clip(act[0], -steer_lim, steer_lim))
-        # Allow reverse on the wire (cooldown); sampling still respects min_spd.
-        msg.drive.speed = float(np.clip(act[1], -max_spd, max_spd))
+        if nu == 3:
+            msg = Twist()
+            msg.linear.x = float(act[0])
+            msg.linear.y = float(act[1])
+            msg.angular.z = float(act[2])
+        else:
+            msg = AckermannDriveStamped()
+            msg.header.stamp = ros.get_clock().now().to_msg()
+            msg.header.frame_id = "base_link"
+            msg.drive.steering_angle = float(np.clip(act[0], -steer_lim, steer_lim))
+            # Allow reverse on the wire (cooldown); sampling still respects min_spd.
+            msg.drive.speed = float(np.clip(act[1], -max_spd, max_spd))
         cmd_pub.publish(msg)
+
+    def _publish_topk() -> None:
+        nonlocal viz_next
+        if viz_k < 1:
+            return
+        now_v = time.perf_counter()
+        if now_v < viz_next:
+            return
+        viz_next = now_v + 0.1
+        st = controller.Dynamics.states.detach()
+        cost = getattr(controller, "last_cost", None)
+        if cost is None:
+            return
+        if st.dim() == 4:
+            st = st[0]
+        cost = cost.detach().reshape(-1)
+        k = min(viz_k, int(cost.shape[0]), int(st.shape[0]))
+        if k < 1 or st.shape[-1] < 2:
+            return
+        idx = torch.topk(cost, k, largest=False).indices
+        xy = st[idx, :, :2].float().cpu().numpy()
+        xy[..., 0] += float(map_center[0])
+        xy[..., 1] += float(map_center[1])
+        msg = MarkerArray()
+        wipe = Marker()
+        wipe.action = Marker.DELETEALL
+        msg.markers.append(wipe)
+        for rank, traj in enumerate(xy):
+            m = Marker()
+            m.header.frame_id = "odom"
+            m.header.stamp = ros.get_clock().now().to_msg()
+            m.ns = "mppi"
+            m.id = rank
+            m.type = Marker.LINE_STRIP
+            m.action = Marker.ADD
+            m.scale.x = 0.03
+            m.pose.orientation.w = 1.0
+            fade = 1.0 - rank / float(k)
+            m.color = ColorRGBA(r=1.0, g=0.45 * fade, b=0.05, a=0.35 + 0.65 * fade)
+            for p in traj:
+                m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.08))
+            msg.markers.append(m)
+        viz_pub.publish(msg)
 
     for event in dora:
         if event is None or event.get("type") == "STOP":
@@ -208,7 +262,9 @@ def main() -> None:
             state_to_ctrl[0] = float(state[0]) - cx
             state_to_ctrl[1] = float(state[1]) - cy
             state_to_ctrl[2] = 0.0  # height BEV is already relative to center cell
-            if state_to_ctrl.size >= 2:
+            # nu==2: trailing slots are the last steer/speed command.
+            # nu==3: sampler reads measured vx, vy, yaw rate (indices 6, 7, 14).
+            if nu == 2 and state_to_ctrl.size >= 2:
                 state_to_ctrl[-2:] = action
             action = np.array(
                 controller.forward(
@@ -219,8 +275,10 @@ def main() -> None:
                 .numpy(),
                 dtype=np.float64,
             )[0]
-            action[0] = float(np.clip(action[0], -steer_lim, steer_lim))
-            action[1] = float(np.clip(action[1], min_spd, max_spd))
+            if nu == 2:
+                action[0] = float(np.clip(action[0], -steer_lim, steer_lim))
+                action[1] = float(np.clip(action[1], min_spd, max_spd))
+            _publish_topk()
 
             now = time.perf_counter()
             dt = now - t0
@@ -233,7 +291,7 @@ def main() -> None:
                 print(
                     f"[hound_controller] dt={mean_dt*1e3:.1f}ms "
                     f"(n={dt_n} last={dt*1e3:.1f}ms) "
-                    f"steer={action[0]:.3f} spd={action[1]:.2f}",
+                    f"cmd={np.array2string(action, precision=3)}",
                     flush=True,
                 )
                 dt_log_t = now

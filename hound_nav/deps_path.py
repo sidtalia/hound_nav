@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -34,6 +35,29 @@ def find_repo(name: str) -> Path:
     )
 
 
+def load_class(spec: str, class_name: str):
+    """Load ``class_name`` from a .py path.
+
+    ``spec`` is absolute, or ``<repo>/<path-inside-repo>`` under workspace src
+    (``mppi/mppi/Dynamics/SimpleCarDynamicsTCUDA.py``).
+    """
+    path = Path(spec)
+    if not path.is_file():
+        repo, _, rest = spec.partition("/")
+        path = find_repo(repo) / rest
+    if not path.is_file():
+        raise FileNotFoundError(spec)
+    # ponytail: one module name per stem; two files with the same stem collide.
+    name = "hound_cfg_" + path.stem
+    module_spec = importlib.util.spec_from_file_location(name, path)
+    if module_spec is None or module_spec.loader is None:
+        raise ImportError(spec)
+    mod = importlib.util.module_from_spec(module_spec)
+    sys.modules[name] = mod
+    module_spec.loader.exec_module(mod)
+    return getattr(mod, class_name)
+
+
 def setup_dependency_paths() -> dict[str, Path]:
     """Insert dependency roots on sys.path (idempotent).
 
@@ -61,3 +85,15 @@ def setup_dependency_paths() -> dict[str, Path]:
     if mppi_root is not None:
         out["mppi"] = mppi_root
     return out
+
+
+if __name__ == "__main__":
+    cls = load_class("mppi/mppi/Sampling/Delta_Sampling.py", "Delta_Sampling")
+    assert cls.__name__ == "Delta_Sampling"
+    try:
+        load_class("/no/such/file.py", "X")
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("missing file should fail")
+    print("ok")

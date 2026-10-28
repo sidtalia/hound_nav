@@ -24,7 +24,7 @@ class TrajBuffer:
             pad = np.zeros((arr.shape[0], 4), dtype=np.float64)
             pad[:, : arr.shape[1]] = arr
             arr = pad
-        self._path = np.ascontiguousarray(arr[:, :4])
+        self._path = np.ascontiguousarray(arr)
 
     def append(self, path: np.ndarray) -> None:
         arr = np.asarray(path, dtype=np.float64)
@@ -34,7 +34,6 @@ class TrajBuffer:
             pad = np.zeros((arr.shape[0], 4), dtype=np.float64)
             pad[:, : arr.shape[1]] = arr
             arr = pad
-        arr = arr[:, :4]
         if self._path is None or len(self._path) == 0:
             self.replace(arr)
             return
@@ -182,12 +181,16 @@ class TrajBuffer:
         body = np.copy(world)
         body[:, :2] -= pos
         t = int(timesteps)
+        w = 4 if body.shape[1] <= 4 else int(body.shape[1])
         if ref_i < len(body) - t:
-            return body[ref_i : ref_i + t, :4], False
-        out = np.zeros((t, 4), dtype=np.float64)
-        avail = body[ref_i:, :4]
+            return body[ref_i : ref_i + t, :w], False
+        out = np.zeros((t, w), dtype=np.float64)
+        avail = body[ref_i:, :w]
         out[: len(avail)] = avail
         if len(avail) > 0:
-            out[len(avail) :, :3] = out[len(avail) - 1, :3]
+            if w == 4:
+                out[len(avail) :, :3] = out[len(avail) - 1, :3]
+            else:
+                out[len(avail) :] = out[len(avail) - 1]
         stop = ref_i >= len(body) - 10
         return out, stop

@@ -1,0 +1,125 @@
+# Gates floor + R6 holonomic nav. SSoT.yaml is not read when this file is set.
+#
+#   python3 src/hound_nav/scripts/gates_floor_sim.py --config src/hound_nav/config/gates_r6.yaml
+#   HOUND_NAV_YAML=src/hound_nav/config/gates_r6.yaml ros2 launch hound_core hound_nav.launch.py
+#
+# gates.yaml points at gates.pgm (native 0.02 m). The sim publishes a 0.05 m crop.
+# Map_config must stay the same size and resolution.
+
+sim:
+  map: ../../mushr/mushr_sim/maps/gates.yaml
+  map_res: 0.05
+  map_size: 30.0
+  viser_port: 8081
+
+nav:
+  enabled: true
+  local_map_topic: /hound_mapping/local_map
+  state_topic: /hound_fcu_control/control_state
+  path_topic: /hound_fcu_control/mission/path
+  goal_topic: /goal_pose
+  cmd_topic: /hound_nav/cmd_ackermann
+  plan_topic: /hound_nav/local_plan
+  plan_diagnostics_topic: /hound_nav/planner_diagnostics
+  plan_markers_topic: /hound_nav/local_plan_arrows
+  planner_hz: 5.0
+  control_rate_hz: 50.0
+  cruise_speed_mps: 1.0
+  control_state_dims: 17
+  track_ref_metric: xy
+  screw_length_m: 1.0
+  lookahead: 8.0
+  wp_radius: 0.6
+  mission_manager:
+    enabled: false
+  planner_cv_viz: false
+  planner_cv_viz_window: hound_planner_vis
+  planner_cv_viz_size: 320
+
+  MPPI_config:
+    ROLLOUTS: 1024
+    TIMESTEPS: 16
+    BINS: 1
+    u_per_command: 1
+    n_iter: 1
+    viz_k: 12
+
+  Map_config:
+    map_size: 30.0
+    map_res: 0.05
+
+  Dynamics_config:
+    file: mppi/mppi/Dynamics/HolonomicDynamicsTCUDA.py
+    class: HolonomicDynamics
+    dt: 0.05
+    car_length: 0.7
+    car_width: 0.75
+
+  Sampling_config:
+    file: mppi/mppi/Sampling/HolonomicDeltaSampling.py
+    class: HolonomicDeltaSampling
+    control_dim: 3
+    noise_0: 0.3
+    noise_1: 0.2
+    noise_2: 0.3
+    scaled_dt: 0.1
+    temperature: 0.1
+    min_vel: -0.2
+    max_vel: 1.55
+    vy_max: 0.55
+    max_omega: 1.5
+
+  Cost_config:
+    file: hound_nav/hound_nav/holonomicTrackingCostCUDA.py
+    class: HolonomicTrackingCost
+    pos_w: 1.0
+    speed_w: 0.1
+    vy_w: 2.0
+    omega_w: 0.1
+    heading_w: 0.1
+    scaling_factor: 1.0
+    critical_RI: 0.8
+    critical_vert_acc: 3.0
+    roll_ditch_w: 50.0
+    lethal_w: 50.0
+    car_bb_length: 0.7
+    car_bb_width: 0.75
+
+  Planner_config:
+    unstuck_expansions: 40000
+    experiment_info_default:
+      bidirectional: true
+      resolution: [0.5, 1.571, 0.5, 0.5, 1.0]
+      tolerance: 0.1
+      epsilon: &epsilon [0.25, 0.25, 0.3, 1.0, 1.0, 2.0]
+      backward_epsilon: *epsilon
+      LCR: *epsilon
+      max_level: 12
+      division_factor: 2.0
+      max_expansions: 1250
+      hysteresis: 100
+      preemptive_expansion: {enabled: true, min_preemptive: 32, max_preemptive: 64}
+      node_info:
+        node_type: holonomic_6D
+        length: 0.7
+        width: 0.75
+        map_res: 0.05
+        dt: 0.1
+        timesteps: 8
+        ax_list: [-1.0, 0.0, 1.0]
+        ay_list: [-1.0, 0.0, 1.0]
+        alpha_list: [-1.0, 0.0, 1.0]
+        accel_max: 1.0
+        alpha_max: 0.5
+        max_omega: 1.5
+        max_vel: 1.55
+        min_vel: -0.2
+        vy_max: 0.55
+        vy_floor: 0.2
+        K_strafe: 0.5
+        RI: 0.8
+        max_vert_acc: 3.0
+        max_theta: 30.0
+        del_theta: 28.65
+        del_vel: 2.5
+        del_omega: 1.0

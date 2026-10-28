@@ -40,6 +40,7 @@ def _search(
     expansion_limit: int,
     stop: bool,
     cruise_speed_mps: float,
+    holonomic: bool = False,
     min_goal_dist_m: float = 0.3,
 ) -> tuple[bool, Optional[np.ndarray], int]:
     goal_dist = float(np.linalg.norm(start_state[:2] - goal_xy[:2]))
@@ -59,23 +60,33 @@ def _search(
     bitmap[..., 0] = torch.from_numpy(np.ascontiguousarray(costmap))
     bitmap[..., 1] = torch.from_numpy(np.ascontiguousarray(heightmap))
     offset = map_res * np.array(bitmap.shape[:2], dtype=np.float64) * 0.5
-
-    start = torch.zeros(4, dtype=torch.float32)
-    goal = torch.zeros(4, dtype=torch.float32)
+    # holonomic_6D state is x, y, yaw, vx, vy, omega. Kinodynamic stays 4.
+    n = 6 if holonomic else 4
+    start = torch.zeros(n, dtype=torch.float32)
+    goal = torch.zeros(n, dtype=torch.float32)
     start[:2] = torch.from_numpy(start_state[:2] + offset - map_center)
     goal[:2] = torch.from_numpy(goal_xy[:2] + offset - map_center)
-    start[2] = float(start_state[5])
-    start[3] = float(np.linalg.norm(start_state[6:8]))
-    if start[3] > 1.0 and start_state[6] > 0.5:
-        v = start_state[6:8]
-        theta = float(start_state[5])
-        dx = v[0] * np.cos(theta) - v[1] * np.sin(theta)
-        dy = v[0] * np.sin(theta) + v[1] * np.cos(theta)
-        start[2] = float(np.arctan2(dy, dx))
+    yaw = float(start_state[5])
     dx = float(goal[0] - start[0])
     dy = float(goal[1] - start[1])
-    goal[2] = float(np.arctan2(dy, dx))
-    goal[3] = 0.0 if stop else float(cruise_speed_mps)
+    goal_yaw = float(np.arctan2(dy, dx))
+    if n == 6:
+        start[2] = yaw
+        start[3] = float(start_state[6])
+        start[4] = float(start_state[7]) if start_state.size > 7 else 0.0
+        start[5] = float(start_state[14]) if start_state.size > 14 else 0.0
+        goal[2] = goal_yaw
+        goal[3] = 0.0 if stop else float(cruise_speed_mps)
+    else:
+        start[2] = yaw
+        start[3] = float(np.linalg.norm(start_state[6:8]))
+        if start[3] > 1.0 and start_state[6] > 0.5:
+            v = start_state[6:8]
+            dx_v = v[0] * np.cos(yaw) - v[1] * np.sin(yaw)
+            dy_v = v[0] * np.sin(yaw) + v[1] * np.cos(yaw)
+            start[2] = float(np.arctan2(dy_v, dx_v))
+        goal[2] = goal_yaw
+        goal[3] = 0.0 if stop else float(cruise_speed_mps)
 
     # IGHA* pybind expects int hysteresis_threshold (not float).
     success = planner.search(
@@ -153,6 +164,12 @@ def main() -> None:
                 expansion_limit=pdef["expansion_limit"],
                 stop=False,
                 cruise_speed_mps=cruise_speed_mps,
+                holonomic=str(
+                    planner_cfg["experiment_info_default"]["node_info"].get(
+                        "node_type", ""
+                    )
+                )
+                == "holonomic_6D",
             )
         except Exception:
             traceback.print_exc()
