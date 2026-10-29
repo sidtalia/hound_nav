@@ -54,6 +54,15 @@ nav:
     dt: 0.05
     car_length: 0.7
     car_width: 0.75
+    ax_gain: 1.0
+    tau_ax: 1.0
+    ay_gain: 1.0
+    tau_ay: 1.0
+    omega_gain: 1.0
+    tau_omega: 1.0
+    drag_x: 0.0
+    drag_y: 0.0
+    drag_omega: 0.0
 
   Sampling_config:
     file: mppi/mppi/Sampling/HolonomicDeltaSampling.py

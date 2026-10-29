@@ -11,6 +11,14 @@ sim:
   map_res: 0.05
   map_size: 30.0
   viser_port: 8081
+  # Lethal mask: empty → the floor_plan ink is the mask (paper free, ink lethal).
+  # A lethal_f32 yaml still works if you point this at one. nvblox stays empty.
+  lethal_map_path: ""
+  # Aligned 6502_01 page: Viser picture AND the planner lethal mask.
+  # Written by plan_align.py on save.
+  floor_plan: /root/colcon_ws/maps/gates_f1_view.yaml
+  # Named idle-nav missions (YAML) authored from the nav Viser.
+  missions_dir: /root/colcon_ws/maps/missions
 
 nav:
   enabled: true
@@ -24,25 +32,28 @@ nav:
   plan_diagnostics_topic: /hound_nav/planner_diagnostics
   plan_markers_topic: /hound_nav/local_plan_arrows
   planner_hz: 1.0
-  control_rate_hz: 20.0
+  control_rate_hz: 10.0
   cruise_speed_mps: 0.0
   control_state_dims: 17
   track_ref_metric: screw
   screw_length_m: 1.0
   lookahead: 8.0
   wp_radius: 0.25
+  # Idle missions are authored/run in robot_bridge Viser (not mission_manager).
   mission_manager:
     enabled: false
+  mission_wp_radius: 1.5   # metres: advance to the next WP when this close
   planner_cv_viz: false
   planner_cv_viz_window: hound_planner_vis
   planner_cv_viz_size: 320
 
   MPPI_config:
     ROLLOUTS: 1024
-    TIMESTEPS: 16
+    TIMESTEPS: 12
     BINS: 1
     u_per_command: 1
-    n_iter: 1
+    command_step: 5
+    n_iter: 6
     viz_k: 12
 
   Map_config:
@@ -55,6 +66,15 @@ nav:
     dt: &dt 0.1
     car_length: &car_length 0.7
     car_width: &car_width 0.75
+    ax_gain: 0.95
+    tau_ax: 0.5
+    drag_x: 0.1
+    ay_gain: 0.95
+    tau_ay: 0.5
+    drag_y: 0.1
+    omega_gain: 0.95
+    tau_omega: 0.5
+    drag_omega: 0.1
 
   Sampling_config:
     file: mppi/mppi/Sampling/HolonomicDeltaSampling.py
@@ -64,11 +84,11 @@ nav:
     noise_1: 1.0
     noise_2: 1.0
     scaled_dt: *dt
-    temperature: 1.0
+    temperature: 0.1
     min_vel: 0.0
-    max_vel: 1.55
-    vy_max: 0.55
-    max_omega: 1.5
+    max_vel: &max_vel 1.0
+    vy_max: &vy_max 1.0
+    max_omega: &max_omega 1.0
 
   Cost_config:
     file: hound_nav/hound_nav/holonomicTrackingCostCUDA.py
@@ -87,7 +107,7 @@ nav:
     car_bb_width: *car_width
 
   Planner_config:
-    unstuck_expansions: 40000
+    unstuck_expansions: 5000
     experiment_info_default:
       bidirectional: true
       resolution: [0.5, 1.571, 0.5, 0.5, 1.0]
@@ -112,16 +132,17 @@ nav:
         width: *car_width
         map_res: 0.05
         dt: *dt
-        timesteps: 7
-        ax_list: [-1.0, 0.0, 1.0]
-        ay_list: [-1.0, 0.0, 1.0]
-        alpha_list: [-1.0, 0.0, 1.0]
+        timesteps: 5
+        # A minus on an alias is a string. The launch resolves `-*name` to minus that cap.
+        ax_list: [-*max_vel, 0.0, *max_vel]
+        ay_list: [-*vy_max, 0.0, *vy_max]
+        alpha_list: [-*max_omega, 0.0, *max_omega]
         accel_max: 1.0
         alpha_max: 0.5
-        max_omega: 1.5
-        max_vel: 1.55
+        max_omega: *max_omega
+        max_vel: *max_vel
         min_vel: 0.0
-        vy_max: 0.55
+        vy_max: *vy_max
         vy_floor: 0.2
         K_strafe: 0.25
         RI: 0.5

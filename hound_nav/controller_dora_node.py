@@ -28,12 +28,13 @@ import rclpy
 import torch
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point, Twist
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float64MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from dora import Node
 from rclpy.node import Node as RosNode
 from rclpy.qos import qos_profile_sensor_data
 from hound_nav.pdef_codec import unpack_map, unpack_track
+from hound_nav.wire_scale import to_wire
 
 
 def main() -> None:
@@ -74,6 +75,8 @@ def main() -> None:
     cmd_pub = ros.create_publisher(cmd_type, cmd_topic, qos_profile_sensor_data)
     viz_k = int(MPPI_config.get("viz_k", 0))
     viz_pub = ros.create_publisher(MarkerArray, "/hound_nav/mppi_topk", 1)
+    # Cheapest rollout's body twist at each vertex, so the drive log can plot it.
+    twist_pub = ros.create_publisher(Float64MultiArray, "/hound_nav/mppi_topk_twist", 1)
     viz_next = 0.0
     dora = Node()
     print(
@@ -130,10 +133,11 @@ def main() -> None:
     def _publish(act: np.ndarray) -> None:
         if nu == 3:
             msg = Twist()
-            # shortcut: debug gain on the wire only, remove when the base tracks ~0.1 m/s.
-            msg.linear.x = float(act[0]) * 5.0
-            msg.linear.y = float(act[1]) * 5.0
-            msg.angular.z = float(act[2]) * 5.0
+            # Planner units are m/s at the cap. The wire is those divided by the knob.
+            wx, wy, ww = to_wire(float(act[0]), float(act[1]), float(act[2]))
+            msg.linear.x = wx
+            msg.linear.y = wy
+            msg.angular.z = ww
         else:
             msg = AckermannDriveStamped()
             msg.header.stamp = ros.get_clock().now().to_msg()
@@ -162,6 +166,13 @@ def main() -> None:
         if k < 1 or st.shape[-1] < 2:
             return
         idx = torch.topk(cost, k, largest=False).indices
+        best = st[int(idx[0])].float().cpu().numpy()
+        if best.shape[0] >= 1 and best.shape[-1] > 14:
+            dt = float(controller.Dynamics.dt)
+            flat = [dt, float(best.shape[0])]
+            for row in best:
+                flat.extend((float(row[6]), float(row[7]), float(row[14])))
+            twist_pub.publish(Float64MultiArray(data=flat))
         xy = st[idx, :, :2].float().cpu().numpy()
         xy[..., 0] += float(map_center[0])
         xy[..., 1] += float(map_center[1])
@@ -311,7 +322,7 @@ def main() -> None:
                 dt_sum = 0.0
                 dt_n = 0
             if controller.Costs.constraint_violation:
-                action = np.zeros(2)
+                action = np.zeros(nu)
                 if state.size > 6 and state[6] > 0.5:
                     controller.reset()
                 cooldown_until = now + cooldown_s
@@ -323,8 +334,7 @@ def main() -> None:
                         flush=True,
                     )
             if now < cooldown_until:
-                action = np.zeros(2)
-                action[1] = 0.0  # m/s light reverse during cooldown
+                action = np.zeros(nu)
             _publish(action)
         except Exception:
             traceback.print_exc()

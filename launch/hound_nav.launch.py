@@ -21,6 +21,40 @@ _core_launch = Path(__file__).resolve().parents[2] / "hound_core" / "launch"
 sys.path.insert(0, str(_core_launch))
 from hound_launch_common import build_nav_dora_actions, find_ssot  # noqa: E402
 
+# PyYAML has no negation. `-*max_vel` in a flow list is the string "-*max_vel".
+_ACTION_LISTS = ("ax_list", "ay_list", "alpha_list")
+_CAP_KEYS = ("max_vel", "vy_max", "max_omega")
+
+
+def _resolve_action_lists(nav: dict) -> None:
+    info = (
+        (nav.get("Planner_config") or {})
+        .get("experiment_info_default", {})
+        .get("node_info")
+    )
+    if not isinstance(info, dict):
+        return
+    sampling = nav.get("Sampling_config") or {}
+    caps = {}
+    for key in _CAP_KEYS:
+        raw = info.get(key, sampling.get(key))
+        if isinstance(raw, (int, float)):
+            caps[key] = float(raw)
+    for name in _ACTION_LISTS:
+        seq = info.get(name)
+        if not isinstance(seq, list):
+            continue
+        resolved = []
+        for item in seq:
+            if isinstance(item, str) and item.startswith("-*"):
+                key = item[2:]
+                if key not in caps:
+                    raise RuntimeError(f"{name} entry {item} has no numeric cap {key}")
+                resolved.append(-caps[key])
+            else:
+                resolved.append(float(item))
+        info[name] = resolved
+
 
 def generate_launch_description():
     override = os.environ.get("HOUND_NAV_YAML", "").strip()
@@ -39,6 +73,8 @@ def generate_launch_description():
         nav = dict(ssot.get("nav") or {})
         if not nav:
             raise RuntimeError(f"SSoT has no nav: block ({ssot_file})")
+
+    _resolve_action_lists(nav)
 
     map_topic = str(nav.get("local_map_topic", "/hound_mapping/local_map"))
     state_topic = str(nav.get("state_topic", "/hound_fcu_control/control_state"))
